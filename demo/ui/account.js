@@ -1,5 +1,15 @@
 // @ts-check
 /**
+ * Account — the HF login chip and the daily-limit modal.
+ *
+ * Reads `/api/me` to learn the current tier (anonymous / signed-in / PRO) and
+ * remaining daily talk-time, renders a sign-in pill or a signed-in chip with a
+ * small popover (tier, remaining, sign out, upgrade), and shows the limit modal
+ * when a conversation is refused or cut. The time metering itself lives in
+ * main.js (heartbeat loop) + the server; this module is just the surface.
+ *
+ * Inert unless the deploy is in LB mode (`/api/me` → `{enabled:true}`).
+ */
 
 import { $, escHtml } from "./dom.js";
 
@@ -10,22 +20,206 @@ const HF_MARK = `<svg class="hf-logo" viewBox="0 0 95 88" fill="none" aria-hidde
 
 /** @param {number} sec @returns {string} "m:ss" */
 function fmt(sec) {
-    pass  # TODO: implement
+  const s = Math.max(0, Math.round(sec));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 }
 
 export class Account {
+  constructor() {
+    /** @type {HTMLElement} */
+    this._root = $("#account");
+    /** @type {HTMLDialogElement} */
+    this._modal = $("#limit-modal");
+    this._modalTitle = $("#limit-title");
+    this._modalMsg = $("#limit-msg");
+    this._modalNote = $("#limit-note");
+    /** @type {HTMLAnchorElement} */
+    this._modalCta = /** @type {any} */ ($("#limit-cta"));
 
+    /** @type {{enabled:boolean, auth?:boolean, loggedIn?:boolean, username?:string, avatar?:string, tier?:string, remainingSec?:number|null, limitSec?:number|null, loginUrl?:string|null, logoutUrl?:string|null}} */
+    this._me = { enabled: false };
+    this._refreshId = 0;
+    this._popoverOpen = false;
 
+    $("#limit-close").addEventListener("click", () => this._modal.close());
+    this._modal.addEventListener("click", (e) => {
+      if (e.target === this._modal) this._modal.close();
+    });
+    // Close the popover on an outside click.
+    document.addEventListener("click", (e) => {
+      if (this._popoverOpen && !this._root.contains(/** @type {Node} */ (e.target))) {
+        this._closePopover();
+      }
+    });
+  }
 
+  get tier() {
+    return this._me.tier || "anon";
+  }
 
+  /** Fetch `/api/me` and (re)render the chip. Safe to call repeatedly (load,
+   *  after the OAuth redirect, after a conversation ends). */
+  async refresh() {
+    const refreshId = ++this._refreshId;
+    let me;
+    try {
+      const res = await fetch("api/me");
+      me = res.ok ? await res.json() : { enabled: false };
+    } catch {
+      me = { enabled: false };
+    }
+    if (refreshId !== this._refreshId) return;
+    this._me = me;
+    this._render();
+  }
 
+  _render() {
+    const me = this._me;
+    if (!me.enabled) {
+      this._root.hidden = true;
+      this._root.innerHTML = "";
+      return;
+    }
+    this._root.hidden = false;
 
+    if (!me.loggedIn) {
+      // Signed-out: a sign-in pill (only when OAuth is actually available).
+      if (me.auth && me.loginUrl) {
+        this._root.innerHTML = `<a class="signin-pill" href="${escHtml(me.loginUrl)}" title="Sign in for more time"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg><span>Sign in</span></a>`;
+      } else {
+        this._root.innerHTML = "";
+        this._root.hidden = true;
+      }
+      return;
+    }
 
+    // Signed-in: avatar + handle chip that toggles a popover.
+    const isPro = me.tier === "pro";
+    // Org members get unlimited usage too, but aren't PRO — don't brand them so.
+    const isUnlimited = isPro || me.tier === "org";
+    const avatar = me.avatar
+      ? `<img class="account-avatar" src="${escHtml(me.avatar)}" alt="" />`
+      : `<span class="account-avatar account-avatar-fallback">${escHtml((me.username || "?")[0].toUpperCase())}</span>`;
+    const remaining =
+      isUnlimited || me.remainingSec == null
+        ? "Unlimited"
+        : `${fmt(me.remainingSec)} left today`;
+    const tierLabel = isPro ? "PRO" : isUnlimited ? "Team" : "Free";
 
+    this._root.innerHTML = `
+      <button id="account-chip" class="account-chip" aria-haspopup="true" aria-expanded="false">
+        ${avatar}
+        <span class="account-handle">${escHtml(me.username || "you")}</span>
+        ${isPro
+          ? '<span class="account-pro">PRO</span>'
+          : me.tier === "org"
+            ? '<span class="account-pro account-team">TEAM</span>'
+            : ""}
+      </button>
+      <div id="account-pop" class="account-pop" hidden>
+        <div class="account-pop-row account-pop-name">${escHtml(me.username || "you")}</div>
+        <div class="account-pop-row account-pop-meta">
+          <span class="account-tier">${tierLabel}</span>
+          <span class="account-remaining">${escHtml(remaining)}</span>
+        </div>
+        ${isUnlimited ? "" : `<a class="account-pop-link" href="${PRO_URL}" target="_blank" rel="noopener">Upgrade to PRO</a>`}
+        <a class="account-pop-link account-signout" href="${escHtml(me.logoutUrl || "#")}">Sign out</a>
+      </div>`;
 
+    const chip = $("#account-chip");
+    chip.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this._popoverOpen ? this._closePopover() : this._openPopover();
+    });
+  }
 
+  _openPopover() {
+    const pop = document.getElementById("account-pop");
+    const chip = document.getElementById("account-chip");
+    if (!pop || !chip) return;
+    pop.hidden = false;
+    chip.setAttribute("aria-expanded", "true");
+    this._popoverOpen = true;
+  }
 
+  _closePopover() {
+    const pop = document.getElementById("account-pop");
+    const chip = document.getElementById("account-chip");
+    if (pop) pop.hidden = true;
+    if (chip) chip.setAttribute("aria-expanded", "false");
+    this._popoverOpen = false;
+  }
 
+  /**
+   * Show the limit modal for a tier — used both when a conversation is refused
+   * at start (402) and when a live one is cut (heartbeat `expired`).
+   * @param {string} [tier]
+   */
+  showLimit(tier = this.tier) {
+    const canSignIn = this._me.auth && this._me.loginUrl;
+    this._modalTitle.textContent = "Thanks for chatting!";
+    if (tier === "anon") {
+      this._modalMsg.textContent =
+        "Guest conversations run for 5 minutes. Sign in with AvicenaIG to get 10 minutes a day for free, and PRO members chat with no limit at all.";
+      this._modalNote.textContent = "Your free minutes refresh tomorrow.";
+      if (canSignIn) {
+        this._modalCta.innerHTML = `${HF_MARK}<span>Sign in with AvicenaIG</span>`;
+        this._modalCta.href = /** @type {string} */ (this._me.loginUrl);
+        this._modalCta.hidden = false;
+      } else {
+        this._modalCta.hidden = true;
+      }
+    } else {
+      // Signed-in, non-PRO.
+      this._modalMsg.textContent =
+        "You've enjoyed your 10 minutes for today. Go PRO for unlimited conversations and to support open source AI.";
+      this._modalNote.textContent = "Or come back tomorrow. Your minutes reset daily.";
+      this._modalCta.innerHTML = "<span>Upgrade to PRO</span>";
+      this._modalCta.href = PRO_URL;
+      this._modalCta.hidden = false;
+    }
+    if (!this._modal.open) this._modal.showModal();
+  }
 
+  /** Replace a stale signed-in chip and ask the user to authenticate again.
+   *  @param {string | null | undefined} loginUrl */
+  showLoginRequired(loginUrl) {
+    // Teardown starts an account refresh before this runs. Invalidate that
+    // request so a revoked-but-not-yet-expired token cannot restore the stale
+    // signed-in chip when `/api/me` eventually responds.
+    this._refreshId += 1;
+    const url = loginUrl || this._me.loginUrl;
+    this._me = {
+      ...this._me,
+      enabled: true,
+      auth: !!url,
+      loggedIn: false,
+      tier: "anon",
+      loginUrl: url,
+    };
+    this._render();
+    this._modalTitle.textContent = "Sign in again";
+    this._modalMsg.textContent =
+      "Your AvicenaIG session expired or was revoked. Sign in again to start a conversation.";
+    this._modalNote.textContent = "This keeps your account and conversation time secure.";
+    if (url) {
+      this._modalCta.innerHTML = `${HF_MARK}<span>Sign in with AvicenaIG</span>`;
+      this._modalCta.href = url;
+      this._modalCta.hidden = false;
+    } else {
+      this._modalCta.hidden = true;
+    }
+    if (!this._modal.open) this._modal.showModal();
+  }
 
+  /** Show a warm "we're at capacity" message when even the waiting line is full.
+   *  Reuses the limit modal shell; no call-to-action, just reassurance. */
+  showBusy() {
+    this._modalTitle.textContent = "Hugged to the limit 🤗";
+    this._modalMsg.textContent =
+      "Every slot and the whole line are full right now. Too much love! Grab a coffee and pop back in a minute.";
+    this._modalNote.textContent = "A spot usually opens up within a few minutes.";
+    this._modalCta.hidden = true;
+    if (!this._modal.open) this._modal.showModal();
+  }
 }

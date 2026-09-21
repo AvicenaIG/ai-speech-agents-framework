@@ -17,10 +17,13 @@ S2S_VOICE = os.getenv("S2S_VOICE", "Aiden")
 
 
 class Assistant(Agent):
-    pass  # TODO: implement
     def __init__(self) -> None:
-        pass  # TODO: implement
+        super().__init__(instructions="You are a helpful voice assistant. Keep answers short and conversational.")
 
+    @function_tool
+    async def get_current_time(self) -> str:
+        """Return the current local time."""
+        return datetime.now().strftime("%H:%M")
 
 
 server = AgentServer()
@@ -28,6 +31,27 @@ server = AgentServer()
 
 @server.rtc_session()
 async def entrypoint(ctx: JobContext) -> None:
+    session: AgentSession[None] = AgentSession(
+        llm=openai.realtime.RealtimeModel(
+            base_url=S2S_BASE_URL,
+            api_key="not-needed",
+            voice=S2S_VOICE,
+            modalities=["audio"],
+            # ai-speech-agents-framework runs its own VAD; these are the fields it reads.
+            turn_detection=ServerVad(
+                type="server_vad",
+                create_response=True,
+                interrupt_response=True,
+                silence_duration_ms=500,
+            ),
+            # The server always transcribes with its configured STT; the model name is ignored.
+            input_audio_transcription=AudioTranscription(model="local"),
+            input_audio_noise_reduction=None,
+            max_session_duration=None,
+        )
+    )
+    await session.start(agent=Assistant(), room=ctx.room)
 
 
 if __name__ == "__main__":
+    cli.run_app(server)

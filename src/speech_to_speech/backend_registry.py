@@ -10,20 +10,26 @@ from threading import Event
 from typing import Any, Literal
 
 from ai_speech_agents_framework.arguments_classes.chat_completions_language_model_arguments import (
+    ChatCompletionsLanguageModelHandlerArguments,
 )
 from ai_speech_agents_framework.arguments_classes.chat_tts_arguments import ChatTTSHandlerArguments
 from ai_speech_agents_framework.arguments_classes.drama3_tts_arguments import Drama3TTSHandlerArguments
 from ai_speech_agents_framework.arguments_classes.facebookmms_tts_arguments import FacebookMMSTTSHandlerArguments
 from ai_speech_agents_framework.arguments_classes.faster_whisper_stt_arguments import (
+    FasterWhisperSTTHandlerArguments,
 )
 from ai_speech_agents_framework.arguments_classes.kitten_tts_arguments import KittenTTSHandlerArguments
 from ai_speech_agents_framework.arguments_classes.kokoro_tts_arguments import KokoroTTSHandlerArguments
 from ai_speech_agents_framework.arguments_classes.language_model_arguments import (
+    LanguageModelHandlerArguments,
+    MLXLanguageModelHandlerArguments,
 )
 from ai_speech_agents_framework.arguments_classes.minimax_tts_arguments import MiniMaxTTSHandlerArguments
 from ai_speech_agents_framework.arguments_classes.mlx_audio_whisper_arguments import (
+    MLXAudioWhisperSTTHandlerArguments,
 )
 from ai_speech_agents_framework.arguments_classes.nemotron_streaming_stt_arguments import (
+    NemotronStreamingSTTHandlerArguments,
 )
 from ai_speech_agents_framework.arguments_classes.omnivoice_tts_arguments import OmniVoiceTTSHandlerArguments
 from ai_speech_agents_framework.arguments_classes.openai_realtime_stt_arguments import OpenAIRealtimeSTTHandlerArguments
@@ -32,14 +38,17 @@ from ai_speech_agents_framework.arguments_classes.openai_tts_arguments import Op
 from ai_speech_agents_framework.arguments_classes.orukeet_stt_arguments import OrukeetSTTHandlerArguments
 from ai_speech_agents_framework.arguments_classes.paraformer_stt_arguments import ParaformerSTTHandlerArguments
 from ai_speech_agents_framework.arguments_classes.parakeet_tdt_arguments import (
+    ParakeetTDTSTTHandlerArguments,
 )
 from ai_speech_agents_framework.arguments_classes.parakeet_unified_stt_arguments import (
+    ParakeetUnifiedSTTHandlerArguments,
 )
 from ai_speech_agents_framework.arguments_classes.phonon_tts_arguments import PhononTTSHandlerArguments
 from ai_speech_agents_framework.arguments_classes.pocket_tts_arguments import PocketTTSHandlerArguments
 from ai_speech_agents_framework.arguments_classes.qwen3_asr_stt_arguments import Qwen3ASRSTTHandlerArguments
 from ai_speech_agents_framework.arguments_classes.qwen3_tts_arguments import Qwen3TTSHandlerArguments
 from ai_speech_agents_framework.arguments_classes.responses_api_language_model_arguments import (
+    ResponsesApiLanguageModelHandlerArguments,
 )
 from ai_speech_agents_framework.arguments_classes.sense_voice_stt_arguments import SenseVoiceSTTHandlerArguments
 from ai_speech_agents_framework.arguments_classes.supertonic_tts_arguments import SupertonicTTSHandlerArguments
@@ -56,19 +65,35 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class EmptyBackendArguments:
-    pass  # TODO: implement
+    """Argument placeholder for a backend with no backend-specific options."""
 
 
 @dataclass(frozen=True)
 class BackendCapabilities:
-    pass  # TODO: implement
+    """Construction details that affect stage composition, not backend selection."""
 
+    bypasses_transcription_notifier: bool = False
+    supports_audio_input: bool = False
+    supports_llm_proxy: bool = False
+    streams_audio_chunks: bool = False
 
 
 @dataclass(frozen=True)
 class HandlerContext:
-    pass  # TODO: implement
+    """Pipeline-local state made available to every registered factory."""
 
+    stop_event: Event
+    queue_in: Queue[Any]
+    queue_out: Queue[Any]
+    text_output_queue: Queue[Any]
+    should_listen: Event
+    cancel_scope: CancelScope
+    speculative_turns: SpeculativeTurnTracker
+    pipeline_index: int
+    sample_rate: int
+    enable_live_transcription: bool
+    live_transcription_update_interval: float
+    detect_llm_output_language: bool = False
 
 
 HandlerFactory = Callable[[HandlerContext, Mapping[str, Any]], Any]
@@ -77,100 +102,606 @@ ConfigNormalizer = Callable[[Any], BackendConfig]
 
 @dataclass(frozen=True)
 class BackendSpec:
-    pass  # TODO: implement
+    """Static construction metadata for one built-in backend."""
 
+    name: str
+    kind: BackendKind
+    config_type: type[Any]
+    create_handler: HandlerFactory
+    config_prefix: str | None = None
+    normalize_config: ConfigNormalizer | None = None
+    required_extra: str | None = None
+    capabilities: BackendCapabilities = field(default_factory=BackendCapabilities)
 
     def normalize(self, config: Any) -> BackendConfig:
-        pass  # TODO: implement
+        if not isinstance(config, self.config_type):
+            raise TypeError(f"Backend {self.name!r} expects {self.config_type.__name__}, got {type(config).__name__}.")
+        normalizer = self.normalize_config
+        if normalizer is not None:
+            return normalizer(config)
+        return normalize_dataclass_config(config, self.config_prefix)
 
 
 @dataclass(frozen=True)
 class BackendSelection:
-    pass  # TODO: implement
+    """A selected registry entry and its normalized configuration."""
 
+    spec: BackendSpec
+    config: BackendConfig
 
+    @property
     def name(self) -> str:
-        pass  # TODO: implement
+        return self.spec.name
 
+    @property
     def kind(self) -> BackendKind:
-        pass  # TODO: implement
+        return self.spec.kind
 
     def copy_for_pipeline(self) -> BackendSelection:
-        pass  # TODO: implement
+        return BackendSelection(self.spec, deepcopy(self.config))
 
 
 def normalize_dataclass_config(config: Any, prefix: str | None = None) -> BackendConfig:
-    pass  # TODO: implement
+    """Return handler kwargs without mutating the parsed argument dataclass."""
 
+    normalized: BackendConfig = {}
+    generation: BackendConfig = {}
+    marker = f"{prefix}_" if prefix else None
 
+    for config_field in fields(config):
+        name = config_field.name
+        value = deepcopy(getattr(config, name))
+        if marker and name.startswith(marker):
+            name = name[len(marker) :]
+        if name == "gen_kwargs" and isinstance(value, Mapping):
+            generation.update(value)
+        elif name.startswith("gen_"):
+            generation[name[len("gen_") :]] = value
+        else:
+            normalized[name] = value
 
+    normalized["gen_kwargs"] = generation
+    return normalized
 
 
 def _normalize_facebook_mms_config(config: Any) -> BackendConfig:
-    pass  # TODO: implement
+    normalized = normalize_dataclass_config(config, "facebook_mms")
+    normalized["language"] = normalized.pop("tts_language")
+    return normalized
 
 
 def build_backend_registry(kind: BackendKind, specs: Iterable[BackendSpec]) -> dict[str, BackendSpec]:
-    pass  # TODO: implement
+    """Build an explicit registry and reject ambiguous entries eagerly."""
 
+    registry: dict[str, BackendSpec] = {}
+    for spec in specs:
+        if spec.kind != kind:
+            raise ValueError(f"Backend {spec.name!r} has kind {spec.kind!r}; expected {kind!r}.")
+        if spec.name in registry:
+            raise ValueError(f"Duplicate {kind} backend name: {spec.name!r}.")
+        registry[spec.name] = spec
+    return registry
 
 
 def _optional_dependency_error(selection: BackendSelection, exc: BaseException) -> ImportError | None:
-    pass  # TODO: implement
+    extra = selection.spec.required_extra
+    if extra is None:
+        return None
+    return ImportError(
+        f"Backend {selection.name!r} ({selection.kind}) requires optional dependencies. "
+        f'Install them with `pip install "ai-speech-agents-framework[{extra}]"`. '
+        f"Original import error: {exc}"
+    )
 
 
 def create_backend_handler(selection: BackendSelection, context: HandlerContext) -> Any:
-    pass  # TODO: implement
+    """Construct a handler and turn lazy dependency failures into actionable errors."""
 
+    try:
+        return selection.spec.create_handler(context, selection.config)
+    except ImportError as exc:
+        dependency_error = _optional_dependency_error(selection, exc)
+        if dependency_error is None:
+            raise
+        raise dependency_error from exc
 
 
 def _load_handler(module_name: str, class_name: str) -> type[Any]:
-    pass  # TODO: implement
+    try:
+        module = import_module(module_name)
+    except RuntimeError as exc:
+        # Some optional packages fail at import time with RuntimeError rather
+        # than ImportError when a native dependency is unavailable.
+        raise ImportError(f"Could not import backend module {module_name!r}: {exc}") from exc
+    return getattr(module, class_name)
 
 
 def _simple_handler_factory(
-    pass  # TODO: implement
+    module_name: str,
+    class_name: str,
+    *,
+    setup_should_listen: bool = False,
+    attach_speculative_turns: bool = False,
+    context_kwargs: bool = False,
+    pass_assistant_language_flag: bool = False,
 ) -> HandlerFactory:
     def create(context: HandlerContext, config: Mapping[str, Any]) -> Any:
-        pass  # TODO: implement
+        handler_class = _load_handler(module_name, class_name)
+        setup_kwargs = dict(config)
+        if context_kwargs:
+            setup_kwargs.update(
+                cancel_scope=context.cancel_scope,
+                speculative_turns=context.speculative_turns,
+            )
+        if pass_assistant_language_flag:
+            setup_kwargs["detect_llm_output_language"] = context.detect_llm_output_language
+        handler = handler_class(
+            context.stop_event,
+            queue_in=context.queue_in,
+            queue_out=context.queue_out,
+            setup_args=(context.should_listen,) if setup_should_listen else (),
+            setup_kwargs=setup_kwargs,
+        )
+        if attach_speculative_turns:
+            handler.speculative_turns = context.speculative_turns
+        return handler
 
+    return create
 
 
 def _create_audio_input(context: HandlerContext, _config: Mapping[str, Any]) -> Any:
-    pass  # TODO: implement
+    handler_class = _load_handler("ai_speech_agents_framework.LLM.audio_input_notifier", "AudioInputNotifier")
+    return handler_class(
+        context.stop_event,
+        queue_in=context.queue_in,
+        queue_out=context.queue_out,
+        setup_kwargs={
+            "sample_rate": context.sample_rate,
+            "speculative_turns": context.speculative_turns,
+            "text_output_queue": context.text_output_queue,
+        },
+    )
 
 
 def _create_parakeet(context: HandlerContext, config: Mapping[str, Any]) -> Any:
-    pass  # TODO: implement
+    handler_class = _load_handler("ai_speech_agents_framework.STT.parakeet_tdt_handler", "ParakeetTDTSTTHandler")
+    setup_kwargs = {
+        **config,
+        "enable_live_transcription": context.enable_live_transcription,
+        "live_transcription_update_interval": context.live_transcription_update_interval,
+    }
+    handler = handler_class(
+        context.stop_event,
+        queue_in=context.queue_in,
+        queue_out=context.queue_out,
+        setup_kwargs=setup_kwargs,
+    )
+    handler.speculative_turns = context.speculative_turns
+    return handler
 
 
 def _create_orukeet(context: HandlerContext, config: Mapping[str, Any]) -> Any:
-    pass  # TODO: implement
+    return _simple_handler_factory(
+        "ai_speech_agents_framework.STT.nemo_asr_handler",
+        "NemoASRSTTHandler",
+        attach_speculative_turns=True,
+    )(context, {**config, "detect_language_from_text": True})
 
 
 def _create_openai_tts(context: HandlerContext, config: Mapping[str, Any]) -> Any:
-    pass  # TODO: implement
+    handler_class = _load_handler(
+        "ai_speech_agents_framework.TTS.openai_compatible_handler",
+        "OpenAICompatibleTTSHandler",
+    )
+    return handler_class(
+        context.stop_event,
+        queue_in=context.queue_in,
+        queue_out=context.queue_out,
+        setup_args=(context.should_listen,),
+        setup_kwargs={
+            **config,
+            "cancel_scope": context.cancel_scope,
+            "speculative_turns": context.speculative_turns,
+            "detect_llm_output_language": context.detect_llm_output_language,
+        },
+    )
 
 
 def _create_streaming_stt(class_name: str) -> HandlerFactory:
-    pass  # TODO: implement
     def create(context: HandlerContext, config: Mapping[str, Any]) -> Any:
-        pass  # TODO: implement
+        handler_class = _load_handler("ai_speech_agents_framework.STT.streaming_handler", class_name)
+        setup_kwargs = dict(config)
+        setup_kwargs.pop("gen_kwargs", None)
+        return handler_class(
+            context.stop_event,
+            queue_in=context.queue_in,
+            queue_out=context.queue_out,
+            setup_kwargs={
+                **setup_kwargs,
+                "speculative_turns": context.speculative_turns,
+                "pipeline_index": context.pipeline_index,
+            },
+        )
 
+    return create
 
 
 def _create_local_llm(backend: Literal["transformers", "mlx-lm"]) -> HandlerFactory:
-    pass  # TODO: implement
     def create(context: HandlerContext, config: Mapping[str, Any]) -> Any:
-        pass  # TODO: implement
+        setup_kwargs = dict(config)
+        is_vlm = setup_kwargs.pop("is_vlm", False)
+        if backend == "mlx-lm":
+            setup_kwargs["backend"] = "mlx"
+        setup_kwargs.update(
+            cancel_scope=context.cancel_scope,
+            speculative_turns=context.speculative_turns,
+        )
+        class_name = "VisionLanguageModelHandler" if is_vlm else "LanguageModelHandler"
+        handler_class = _load_handler("ai_speech_agents_framework.LLM.language_model", class_name)
+        return handler_class(
+            context.stop_event,
+            queue_in=context.queue_in,
+            queue_out=context.queue_out,
+            setup_kwargs=setup_kwargs,
+        )
 
+    return create
 
 
 STT_BACKENDS = build_backend_registry(
+    "stt",
+    [
+        BackendSpec(
+            "none",
+            "stt",
+            EmptyBackendArguments,
+            _create_audio_input,
+            capabilities=BackendCapabilities(bypasses_transcription_notifier=True),
+        ),
+        BackendSpec(
+            "whisper",
+            "stt",
+            WhisperSTTHandlerArguments,
+            _simple_handler_factory(
+                "ai_speech_agents_framework.STT.whisper_stt_handler",
+                "WhisperSTTHandler",
+                attach_speculative_turns=True,
+            ),
+            config_prefix="stt",
+        ),
+        BackendSpec(
+            "whisper-mlx",
+            "stt",
+            WhisperSTTHandlerArguments,
+            _simple_handler_factory(
+                "ai_speech_agents_framework.STT.lightning_whisper_mlx_handler",
+                "LightningWhisperSTTHandler",
+                attach_speculative_turns=True,
+            ),
+            config_prefix="stt",
+            required_extra="whisper-mlx",
+        ),
+        BackendSpec(
+            "mlx-audio-whisper",
+            "stt",
+            MLXAudioWhisperSTTHandlerArguments,
+            _simple_handler_factory(
+                "ai_speech_agents_framework.STT.mlx_audio_whisper_handler",
+                "MLXAudioWhisperSTTHandler",
+                attach_speculative_turns=True,
+            ),
+            config_prefix="mlx_audio_whisper",
+        ),
+        BackendSpec(
+            "faster-whisper",
+            "stt",
+            FasterWhisperSTTHandlerArguments,
+            _simple_handler_factory(
+                "ai_speech_agents_framework.STT.faster_whisper_handler",
+                "FasterWhisperSTTHandler",
+                attach_speculative_turns=True,
+            ),
+            config_prefix="faster_whisper_stt",
+            required_extra="faster-whisper",
+        ),
+        BackendSpec(
+            "parakeet-tdt",
+            "stt",
+            ParakeetTDTSTTHandlerArguments,
+            _create_parakeet,
+            config_prefix="parakeet_tdt",
+        ),
+        BackendSpec(
+            "parakeet-unified",
+            "stt",
+            ParakeetUnifiedSTTHandlerArguments,
+            _simple_handler_factory(
+                "ai_speech_agents_framework.STT.nemo_asr_handler",
+                "NemoASRSTTHandler",
+                attach_speculative_turns=True,
+            ),
+            config_prefix="parakeet_unified",
+            required_extra="nemo",
+        ),
+        BackendSpec(
+            "nemotron-streaming",
+            "stt",
+            NemotronStreamingSTTHandlerArguments,
+            _simple_handler_factory(
+                "ai_speech_agents_framework.STT.nemo_asr_handler",
+                "NemoASRSTTHandler",
+                attach_speculative_turns=True,
+            ),
+            config_prefix="nemotron_streaming",
+            required_extra="nemo",
+        ),
+        BackendSpec(
+            "orukeet",
+            "stt",
+            OrukeetSTTHandlerArguments,
+            _create_orukeet,
+            config_prefix="orukeet",
+            required_extra="nemo",
+        ),
+        BackendSpec(
+            "paraformer",
+            "stt",
+            ParaformerSTTHandlerArguments,
+            _simple_handler_factory(
+                "ai_speech_agents_framework.STT.paraformer_handler",
+                "ParaformerSTTHandler",
+                attach_speculative_turns=True,
+            ),
+            config_prefix="paraformer_stt",
+            required_extra="paraformer",
+        ),
+        BackendSpec(
+            "sense-voice",
+            "stt",
+            SenseVoiceSTTHandlerArguments,
+            _simple_handler_factory(
+                "ai_speech_agents_framework.STT.sense_voice_handler",
+                "SenseVoiceSTTHandler",
+                attach_speculative_turns=True,
+            ),
+            config_prefix="sense_voice_stt",
+            required_extra="sensevoice",
+        ),
+        BackendSpec(
+            "qwen3-asr",
+            "stt",
+            Qwen3ASRSTTHandlerArguments,
+            _simple_handler_factory(
+                "ai_speech_agents_framework.STT.qwen3_asr_handler",
+                "Qwen3ASRSTTHandler",
+                attach_speculative_turns=True,
+            ),
+            config_prefix="qwen3_asr",
+        ),
+        BackendSpec(
+            "openai",
+            "stt",
+            OpenAICompatibleSTTHandlerArguments,
+            _simple_handler_factory(
+                "ai_speech_agents_framework.STT.openai_compatible_handler",
+                "OpenAICompatibleSTTHandler",
+                attach_speculative_turns=True,
+            ),
+            config_prefix="openai_stt",
+        ),
+        BackendSpec(
+            "openai-realtime",
+            "stt",
+            OpenAIRealtimeSTTHandlerArguments,
+            _create_streaming_stt("OpenAIRealtimeSTTHandler"),
+            config_prefix="openai_realtime_stt",
+            capabilities=BackendCapabilities(streams_audio_chunks=True),
+        ),
+        BackendSpec(
+            "vllm-realtime",
+            "stt",
+            VLLMRealtimeSTTHandlerArguments,
+            _create_streaming_stt("VLLMRealtimeSTTHandler"),
+            config_prefix="vllm_realtime_stt",
+            capabilities=BackendCapabilities(streams_audio_chunks=True),
+        ),
+    ],
 )
 
 LLM_BACKENDS = build_backend_registry(
+    "llm",
+    [
+        BackendSpec(
+            "transformers",
+            "llm",
+            LanguageModelHandlerArguments,
+            _create_local_llm("transformers"),
+            config_prefix="llm",
+        ),
+        BackendSpec(
+            "mlx-lm",
+            "llm",
+            MLXLanguageModelHandlerArguments,
+            _create_local_llm("mlx-lm"),
+            config_prefix="llm",
+            required_extra="mlx-lm",
+        ),
+        BackendSpec(
+            "responses-api",
+            "llm",
+            ResponsesApiLanguageModelHandlerArguments,
+            _simple_handler_factory(
+                "ai_speech_agents_framework.LLM.responses_api_language_model",
+                "ResponsesApiModelHandler",
+                context_kwargs=True,
+            ),
+            config_prefix="responses_api",
+            capabilities=BackendCapabilities(supports_llm_proxy=True),
+        ),
+        BackendSpec(
+            "chat-completions",
+            "llm",
+            ChatCompletionsLanguageModelHandlerArguments,
+            _simple_handler_factory(
+                "ai_speech_agents_framework.LLM.chat_completions_language_model",
+                "ChatCompletionsApiModelHandler",
+                context_kwargs=True,
+            ),
+            config_prefix="responses_api",
+            capabilities=BackendCapabilities(supports_audio_input=True, supports_llm_proxy=True),
+        ),
+    ],
 )
 
 TTS_BACKENDS = build_backend_registry(
+    "tts",
+    [
+        BackendSpec(
+            "chatTTS",
+            "tts",
+            ChatTTSHandlerArguments,
+            _simple_handler_factory(
+                "ai_speech_agents_framework.TTS.chatTTS_handler",
+                "ChatTTSHandler",
+                setup_should_listen=True,
+                context_kwargs=True,
+            ),
+            config_prefix="chat_tts",
+            required_extra="chattts",
+        ),
+        BackendSpec(
+            "facebookMMS",
+            "tts",
+            FacebookMMSTTSHandlerArguments,
+            _simple_handler_factory(
+                "ai_speech_agents_framework.TTS.facebookmms_handler",
+                "FacebookMMSTTSHandler",
+                setup_should_listen=True,
+                context_kwargs=True,
+            ),
+            normalize_config=_normalize_facebook_mms_config,
+        ),
+        BackendSpec(
+            "omnivoice",
+            "tts",
+            OmniVoiceTTSHandlerArguments,
+            _simple_handler_factory(
+                "ai_speech_agents_framework.TTS.omnivoice_handler",
+                "OmniVoiceTTSHandler",
+                setup_should_listen=True,
+                context_kwargs=True,
+            ),
+            config_prefix="omnivoice",
+            required_extra="omnivoice",
+        ),
+        BackendSpec(
+            "pocket",
+            "tts",
+            PocketTTSHandlerArguments,
+            _simple_handler_factory(
+                "ai_speech_agents_framework.TTS.pocket_tts_handler",
+                "PocketTTSHandler",
+                setup_should_listen=True,
+                context_kwargs=True,
+            ),
+            config_prefix="pocket_tts",
+            required_extra="pocket",
+        ),
+        BackendSpec(
+            "phonon",
+            "tts",
+            PhononTTSHandlerArguments,
+            _simple_handler_factory(
+                "ai_speech_agents_framework.TTS.phonon_tts_handler",
+                "PhononTTSHandler",
+                setup_should_listen=True,
+                context_kwargs=True,
+            ),
+            config_prefix="phonon_tts",
+            required_extra="phonon",
+        ),
+        BackendSpec(
+            "kokoro",
+            "tts",
+            KokoroTTSHandlerArguments,
+            _simple_handler_factory(
+                "ai_speech_agents_framework.TTS.kokoro_handler",
+                "KokoroTTSHandler",
+                setup_should_listen=True,
+                context_kwargs=True,
+            ),
+            config_prefix="kokoro",
+            required_extra="kokoro",
+        ),
+        BackendSpec(
+            "kitten",
+            "tts",
+            KittenTTSHandlerArguments,
+            _simple_handler_factory(
+                "ai_speech_agents_framework.TTS.kitten_tts_handler",
+                "KittenTTSHandler",
+                setup_should_listen=True,
+                context_kwargs=True,
+            ),
+            config_prefix="kitten",
+            required_extra="kitten",
+        ),
+        BackendSpec(
+            "qwen3",
+            "tts",
+            Qwen3TTSHandlerArguments,
+            _simple_handler_factory(
+                "ai_speech_agents_framework.TTS.qwen3_tts_handler",
+                "Qwen3TTSHandler",
+                setup_should_listen=True,
+                context_kwargs=True,
+                pass_assistant_language_flag=True,
+            ),
+            config_prefix="qwen3_tts",
+        ),
+        BackendSpec(
+            "openai",
+            "tts",
+            OpenAICompatibleTTSHandlerArguments,
+            _create_openai_tts,
+            config_prefix="openai_tts",
+        ),
+        BackendSpec(
+            "drama3",
+            "tts",
+            Drama3TTSHandlerArguments,
+            _simple_handler_factory(
+                "ai_speech_agents_framework.TTS.drama3_handler",
+                "Drama3TTSHandler",
+                setup_should_listen=True,
+                context_kwargs=True,
+            ),
+            config_prefix="drama3",
+        ),
+        BackendSpec(
+            "minimax",
+            "tts",
+            MiniMaxTTSHandlerArguments,
+            _simple_handler_factory(
+                "ai_speech_agents_framework.TTS.minimax_tts_handler",
+                "MiniMaxTTSHandler",
+                setup_should_listen=True,
+                context_kwargs=True,
+            ),
+            config_prefix="minimax_tts",
+        ),
+        BackendSpec(
+            "supertonic",
+            "tts",
+            SupertonicTTSHandlerArguments,
+            _simple_handler_factory(
+                "ai_speech_agents_framework.TTS.supertonic_tts_handler",
+                "SupertonicTTSHandler",
+                setup_should_listen=True,
+                context_kwargs=True,
+            ),
+            config_prefix="supertonic_tts",
+            required_extra="supertonic",
+        ),
+    ],
 )
