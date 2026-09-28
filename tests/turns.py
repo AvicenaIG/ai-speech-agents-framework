@@ -4,4 +4,8 @@ from ai_speech_agents_framework.pipeline.speculative_turns import SpeculativeTur
 
 
 def reopen(tracker: SpeculativeTurnTracker, turn_id: str = "turn_1", revision: int = 0) -> int:
-    pass  # TODO: implement
+    """Advance an uncommitted turn through the candidate protocol; skip VAD admission checks."""
+    candidate = tracker.begin_reopen_candidate(turn_id, revision)
+    assert candidate == revision + 1
+    assert tracker.confirm_reopen_candidate(turn_id, revision, candidate)
+    return candidate

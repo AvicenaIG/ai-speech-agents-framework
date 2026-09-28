@@ -15,57 +15,116 @@ from tests.test_nemo_asr_handler import _install_fake_nemo
 
 @pytest.fixture(autouse=True)
 def _quiet_console(monkeypatch: pytest.MonkeyPatch) -> None:
-    pass  # TODO: implement
+    monkeypatch.setattr(nemo_asr_handler.console, "print", lambda *args, **kwargs: None)
 
 
 def _vad_audio(*, turn_id: str = "turn_1") -> VADAudio:
-    pass  # TODO: implement
+    return VADAudio(
+        audio=np.zeros(16000, dtype=np.float32),
+        mode="final",
+        turn_id=turn_id,
+        turn_revision=0,
+        created_at_s=1.0,
+    )
 
 
 def test_cli_nemotron_streaming_defaults() -> None:
-    pass  # TODO: implement
+    args = parse_arguments(["--stt", "nemotron-streaming"])
 
+    assert args.stt_backend.name == "nemotron-streaming"
+    assert args.stt_backend.config["model_name"] == "nvidia/nemotron-speech-streaming-en-0.6b"
+    assert args.stt_backend.config["device"] == "auto"
+    assert args.stt_backend.config["language"] == "en"
+    assert args.stt_backend.spec.required_extra == "nemo"
 
 
 def test_cli_nemotron_streaming_model_name_override() -> None:
-    pass  # TODO: implement
+    args = parse_arguments(
+        [
+            "--stt",
+            "nemotron-streaming",
+            "--nemotron_streaming_model_name",
+            "nvidia/nemotron-3.5-asr-streaming-0.6b",
+        ]
+    )
 
+    assert args.stt_backend.name == "nemotron-streaming"
+    assert args.stt_backend.config["model_name"] == "nvidia/nemotron-3.5-asr-streaming-0.6b"
+    assert args.stt_backend.spec.required_extra == "nemo"
 
 
 def test_multilingual_nemotron_uses_detected_language_per_utterance(monkeypatch: pytest.MonkeyPatch) -> None:
-    pass  # TODO: implement
+    outputs = ["warmup", "Bonjour. <fr-FR>", "Hello. <en-US>", "Hei. <nb-NO>"]
+    prompts: list[str] = []
+    transcribe_kwargs: list[dict[str, Any]] = []
 
     class FakeASRModel:
-        pass  # TODO: implement
+        @classmethod
         def from_pretrained(cls, *args: Any, **kwargs: Any) -> FakeASRModel:
-            pass  # TODO: implement
+            return cls()
 
         def to(self, device: str) -> FakeASRModel:
-            pass  # TODO: implement
+            return self
 
         def set_inference_prompt(self, lang: str) -> None:
-            pass  # TODO: implement
+            prompts.append(lang)
 
         def transcribe(self, audio: Any, **kwargs: Any) -> list[str]:
-            pass  # TODO: implement
+            transcribe_kwargs.append(kwargs)
+            return [outputs.pop(0)]
 
+    _install_fake_nemo(monkeypatch, FakeASRModel)
+    handler = object.__new__(NemoASRSTTHandler)
+    handler.setup(
+        model_name="nvidia/nemotron-3.5-asr-streaming-0.6b",
+        device="cpu",
+        language="en",
+    )
 
+    french = list(handler.process(_vad_audio(turn_id="turn_1")))
+    english = list(handler.process(_vad_audio(turn_id="turn_2")))
 
+    assert isinstance(french[0], Transcription)
+    assert french[0].text == "Bonjour."
+    assert french[0].language_code == "fr"
+    assert isinstance(english[0], Transcription)
+    assert english[0].text == "Hello."
+    assert english[0].language_code == "en"
+    assert handler.last_language == "en"
+    norwegian = list(handler.process(_vad_audio(turn_id="turn_3")))
+    assert isinstance(norwegian[0], Transcription)
+    assert norwegian[0].text == "Hei."
+    assert norwegian[0].language_code == "no"
+    assert language_name_for_prompt(norwegian[0].language_code, enable=True) == "norwegian"
+    assert handler.last_language == "no"
+    assert "auto" in prompts
+    assert any(kwargs.get("target_lang") == "auto" for kwargs in transcribe_kwargs)
 
 
 def test_english_nemotron_keeps_configured_language(monkeypatch: pytest.MonkeyPatch) -> None:
-    pass  # TODO: implement
+    outputs = ["warmup", "Hello. <fr-FR>"]
 
     class FakeASRModel:
-        pass  # TODO: implement
+        @classmethod
         def from_pretrained(cls, *args: Any, **kwargs: Any) -> FakeASRModel:
-            pass  # TODO: implement
+            return cls()
 
         def to(self, device: str) -> FakeASRModel:
-            pass  # TODO: implement
+            return self
 
         def transcribe(self, audio: Any, **kwargs: Any) -> list[str]:
-            pass  # TODO: implement
+            assert kwargs == {}
+            return [outputs.pop(0)]
 
+    _install_fake_nemo(monkeypatch, FakeASRModel)
+    handler = object.__new__(NemoASRSTTHandler)
+    handler.setup(
+        model_name="nvidia/nemotron-speech-streaming-en-0.6b",
+        device="cpu",
+        language="en",
+    )
 
+    events = list(handler.process(_vad_audio()))
 
+    assert events[0].text == "Hello. <fr-FR>"
+    assert events[0].language_code == "en"

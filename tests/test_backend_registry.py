@@ -13,377 +13,1066 @@ import ai_speech_agents_framework.s2s_pipeline as s2s_pipeline
 from ai_speech_agents_framework.arguments_classes.module_arguments import ModuleArguments
 from ai_speech_agents_framework.arguments_classes.vad_arguments import VADHandlerArguments
 from ai_speech_agents_framework.backend_registry import (
+    LLM_BACKENDS,
+    STT_BACKENDS,
+    TTS_BACKENDS,
+    BackendCapabilities,
+    BackendSelection,
+    BackendSpec,
+    HandlerContext,
+    build_backend_registry,
+    create_backend_handler,
 )
 from ai_speech_agents_framework.pipeline.cancel_scope import CancelScope
 from ai_speech_agents_framework.pipeline.speculative_turns import SpeculativeTurnTracker
 from ai_speech_agents_framework.s2s_pipeline import (
+    build_llm_proxy_config,
+    parse_arguments,
+    prepare_all_args,
+    prepare_module_args,
 )
 
 
 @dataclass
 class FakeArguments:
-    pass  # TODO: implement
+    fake_option: str = "default"
 
 
 def _context() -> HandlerContext:
-    pass  # TODO: implement
+    return HandlerContext(
+        stop_event=Event(),
+        queue_in=Queue(),
+        queue_out=Queue(),
+        text_output_queue=Queue(),
+        should_listen=Event(),
+        cancel_scope=CancelScope(),
+        speculative_turns=SpeculativeTurnTracker(),
+        pipeline_index=0,
+        sample_rate=16000,
+        enable_live_transcription=False,
+        live_transcription_update_interval=0.5,
+    )
 
 
 def _factory(_context, config):
-    pass  # TODO: implement
+    return config
 
 
 def test_builtin_registry_lookup_and_cli_choices_share_one_catalog():
-    pass  # TODO: implement
+    module_fields = {config_field.name: config_field for config_field in fields(ModuleArguments)}
 
+    assert tuple(STT_BACKENDS) == module_fields["stt"].metadata["choices"]
+    assert tuple(LLM_BACKENDS) == module_fields["llm_backend"].metadata["choices"]
+    assert tuple(TTS_BACKENDS) == module_fields["tts"].metadata["choices"]
+    assert STT_BACKENDS["parakeet-tdt"].kind == "stt"
+    assert STT_BACKENDS["openai"].kind == "stt"
+    assert STT_BACKENDS["openai-realtime"].capabilities.streams_audio_chunks
+    assert STT_BACKENDS["vllm-realtime"].capabilities.streams_audio_chunks
+    assert not STT_BACKENDS["openai"].capabilities.streams_audio_chunks
+    assert LLM_BACKENDS["responses-api"].kind == "llm"
 
 
 @pytest.mark.parametrize(
+    ("model_name", "supported_languages", "expected"),
+    [
+        ("/models/english-checkpoint", ["en"], {"en"}),
+        ("/models/multilingual.en", ["en", "es"], {"en", "es"}),
+    ],
 )
 def test_session_language_validation_uses_loaded_faster_whisper_capabilities(model_name, supported_languages, expected):
-    pass  # TODO: implement
+    selection = BackendSelection(STT_BACKENDS["faster-whisper"], {"model_name": model_name})
+    handler = SimpleNamespace(model=SimpleNamespace(supported_languages=supported_languages))
 
+    assert s2s_pipeline._stt_session_languages(selection, handler) == expected
+    assert TTS_BACKENDS["qwen3"].kind == "tts"
+    assert TTS_BACKENDS["openai"].kind == "tts"
+    assert TTS_BACKENDS["supertonic"].required_extra == "supertonic"
+    assert LLM_BACKENDS["responses-api"].capabilities.supports_llm_proxy
+    assert LLM_BACKENDS["chat-completions"].capabilities.supports_llm_proxy
+    assert LLM_BACKENDS["chat-completions"].capabilities.supports_audio_input
+    assert not LLM_BACKENDS["transformers"].capabilities.supports_audio_input
+    assert STT_BACKENDS["none"].capabilities.bypasses_transcription_notifier
+    assert not STT_BACKENDS["whisper"].capabilities.bypasses_transcription_notifier
 
 
 def test_parakeet_session_language_selection_remains_unsupported():
-    pass  # TODO: implement
+    selection = BackendSelection(STT_BACKENDS["parakeet-tdt"], {})
 
+    assert s2s_pipeline._stt_session_languages(selection, SimpleNamespace()) == set()
 
 
 @pytest.mark.parametrize(
+    ("model_name", "supported_languages", "accepted"),
+    [
+        ("/models/english-checkpoint", ["en"], False),
+        ("/models/multilingual.en", ["en", "es"], True),
+    ],
 )
 def test_faster_whisper_loaded_languages_control_session_update(monkeypatch, model_name, supported_languages, accepted):
-    pass  # TODO: implement
+    args = parse_arguments(
+        ["--stt", "faster-whisper", "--tts", "openai", "--faster_whisper_stt_model_name", model_name]
+    )
+    stt_handler = SimpleNamespace(model=SimpleNamespace(supported_languages=supported_languages))
+    monkeypatch.setattr(
+        s2s_pipeline,
+        "_build_handlers",
+        lambda **_kwargs: [SimpleNamespace(), stt_handler, SimpleNamespace(), SimpleNamespace(), SimpleNamespace()],
+    )
+    unit = s2s_pipeline._build_pipeline_unit(
+        index=0,
+        stop_event=Event(),
+        module_kwargs=args.module_kwargs,
+        vad_handler_kwargs=args.vad_handler_kwargs,
+        stt_backend=args.stt_backend,
+        llm_backend=args.llm_backend,
+        tts_backend=args.tts_backend,
+    )
+    unit.service.tts_supported_languages = {"en", "es"}
+    conn_id = unit.service.register()
+    update = SessionUpdateEvent.model_validate(
+        {
+            "type": "session.update",
+            "session": {"type": "realtime", "audio": {"input": {"transcription": {"language": "es"}}}},
+        }
+    )
 
+    result = unit.service.handle_session_update(conn_id, update)
 
+    if accepted:
+        assert result is None
+        assert unit.service.build_session_updated(conn_id).session.audio.input.transcription.language == "es"
+    else:
+        assert isinstance(result, RealtimeErrorEvent)
+        assert "STT" in result.error.message
+        assert unit.service._state(conn_id).runtime_config.selected_language is None
 
 
 @pytest.mark.parametrize(
+    ("is_multilingual", "language", "accepted"),
+    [(False, "en", False), (False, "es", False), (True, "es", True), (None, "es", True)],
 )
 def test_transformers_whisper_session_language_uses_loaded_generation_config(
-    pass  # TODO: implement
+    monkeypatch, is_multilingual, language, accepted
 ):
+    args = parse_arguments(["--stt", "whisper", "--tts", "openai"])
+    stt_handler = SimpleNamespace(
+        model=SimpleNamespace(generation_config=SimpleNamespace(is_multilingual=is_multilingual))
+    )
+    monkeypatch.setattr(
+        s2s_pipeline,
+        "_build_handlers",
+        lambda **_kwargs: [SimpleNamespace(), stt_handler, SimpleNamespace(), SimpleNamespace(), SimpleNamespace()],
+    )
+    unit = s2s_pipeline._build_pipeline_unit(
+        index=0,
+        stop_event=Event(),
+        module_kwargs=args.module_kwargs,
+        vad_handler_kwargs=args.vad_handler_kwargs,
+        stt_backend=args.stt_backend,
+        llm_backend=args.llm_backend,
+        tts_backend=args.tts_backend,
+    )
+    unit.service.tts_supported_languages = {"en", "es"}
+    conn_id = unit.service.register()
+    update = SessionUpdateEvent.model_validate(
+        {
+            "type": "session.update",
+            "session": {"type": "realtime", "audio": {"input": {"transcription": {"language": language}}}},
+        }
+    )
 
+    result = unit.service.handle_session_update(conn_id, update)
 
+    if accepted:
+        assert result is None
+        assert unit.service.build_session_updated(conn_id).session.audio.input.transcription.language == language
+    else:
+        assert isinstance(result, RealtimeErrorEvent)
+        assert "STT" in result.error.message
+        assert unit.service._state(conn_id).runtime_config.selected_language is None
 
 
 @pytest.mark.parametrize(("setup_language", "rejected"), [("en", True), (None, False)])
 def test_openai_realtime_stt_auto_reset_is_rejected_only_when_setup_hint_cannot_be_cleared(
-    pass  # TODO: implement
+    monkeypatch, setup_language, rejected
 ):
+    cli = ["--stt", "openai-realtime", "--tts", "openai"]
+    if setup_language is not None:
+        cli.extend(["--openai_realtime_stt_language", setup_language])
+    args = parse_arguments(cli)
+    monkeypatch.setattr(s2s_pipeline, "_build_handlers", lambda **_kwargs: [SimpleNamespace() for _ in range(5)])
+    unit = s2s_pipeline._build_pipeline_unit(
+        index=0,
+        stop_event=Event(),
+        module_kwargs=args.module_kwargs,
+        vad_handler_kwargs=args.vad_handler_kwargs,
+        stt_backend=args.stt_backend,
+        llm_backend=args.llm_backend,
+        tts_backend=args.tts_backend,
+    )
+    conn_id = unit.service.register()
+    update = SessionUpdateEvent.model_validate(
+        {
+            "type": "session.update",
+            "session": {"type": "realtime", "audio": {"input": {"transcription": {"language": "Auto"}}}},
+        }
+    )
 
+    error = unit.service.handle_session_update(conn_id, update)
 
+    if rejected:
+        assert isinstance(error, RealtimeErrorEvent)
+        assert "Auto" in error.error.message and "STT" in error.error.message
+        assert unit.service._state(conn_id).runtime_config.selected_language is None
+    else:
+        assert error is None
+        assert unit.service.build_session_updated(conn_id).session.audio.input.transcription.language == "auto"
 
 
 def test_omnivoice_tts_backend_is_registered_as_optional():
-    pass  # TODO: implement
+    spec = TTS_BACKENDS["omnivoice"]
 
+    assert spec.kind == "tts"
+    assert spec.required_extra == "omnivoice"
 
 
 @pytest.mark.parametrize(("num_threads", "expected_threads"), [(None, 4), (2, 2)])
 def test_phonon_cli_and_registry_construct_native_handler(monkeypatch, num_threads, expected_threads):
-    pass  # TODO: implement
+    from ai_speech_agents_framework.TTS.phonon_tts_handler import PhononTTSHandler
 
+    loaded = []
+    thread_counts = []
 
     def load(**kwargs):
-        pass  # TODO: implement
+        loaded.append(kwargs)
+        return SimpleNamespace(sample_rate=24000, voices=["voice-a"])
 
+    monkeypatch.setitem(sys.modules, "ptts", SimpleNamespace(TTS=load, set_num_threads=thread_counts.append))
+    args = parse_arguments(
+        [
+            "--tts",
+            "phonon",
+            "--phonon_tts_model_name",
+            "/models/test",
+            "--phonon_tts_voice",
+            "voice-a",
+            "--phonon_tts_language",
+            "fr",
+            "--phonon_tts_revision",
+            "revision",
+            "--phonon_tts_blocksize",
+            "256",
+        ]
+        + (["--phonon_tts_num_threads", str(num_threads)] if num_threads is not None else [])
+    )
+    assert args.tts_backend.spec.required_extra == "phonon"
+    assert args.tts_backend.config == {
+        "model_name": "/models/test",
+        "revision": "revision",
+        "voice": "voice-a",
+        "language": "fr",
+        "quant": "q8",
+        "blocksize": 256,
+        "num_threads": expected_threads,
+        "gen_kwargs": {},
+    }
+    handler = create_backend_handler(args.tts_backend, _context())
+    assert isinstance(handler, PhononTTSHandler)
+    assert loaded == [{"config": "/models/test", "revision": "revision", "lang": "fr", "quant": "q8", "device": "cpu"}]
+    assert thread_counts == [expected_threads]
 
 
 def test_phonon_missing_dependency_reports_install_extra(monkeypatch):
-    pass  # TODO: implement
+    monkeypatch.setitem(sys.modules, "ptts", None)
+    args = parse_arguments(["--tts", "phonon", "--phonon_tts_model_name", "/models/test"])
+    with pytest.raises(ImportError, match=r"ai-speech-agents-framework\[phonon\]"):
+        create_backend_handler(args.tts_backend, _context())
 
 
 def test_phonon_stays_on_cpu_when_global_device_is_set():
-    pass  # TODO: implement
+    args = parse_arguments(["--tts", "phonon", "--device", "mps"])
+    prepare_all_args(args)
+    assert "device" not in args.tts_backend.config
 
 
 @pytest.mark.parametrize(("normalizer", "expected"), [("en", {"en"}), ("fr", {"fr"}), ("none", set())])
 @pytest.mark.parametrize("enable_visemes", [False, True])
 def test_phonon_session_languages_match_fixed_normalizer(monkeypatch, normalizer, expected, enable_visemes):
-    pass  # TODO: implement
+    args = parse_arguments(["--stt", "openai", "--tts", "phonon", "--phonon_tts_language", normalizer])
+    args.module_kwargs.enable_visemes = enable_visemes
+    handlers = [SimpleNamespace(), SimpleNamespace(language=normalizer)]
+    if enable_visemes:
+        handlers.append(SimpleNamespace())
+    monkeypatch.setattr(s2s_pipeline, "_build_handlers", lambda **kwargs: handlers)
+    unit = s2s_pipeline._build_pipeline_unit(
+        index=0,
+        stop_event=Event(),
+        module_kwargs=args.module_kwargs,
+        vad_handler_kwargs=args.vad_handler_kwargs,
+        stt_backend=args.stt_backend,
+        llm_backend=args.llm_backend,
+        tts_backend=args.tts_backend,
+    )
+    assert unit.service.tts_supported_languages == expected
 
 
 def test_sensevoice_stt_backend_is_registered_with_its_optional_extra():
-    pass  # TODO: implement
+    spec = STT_BACKENDS["sense-voice"]
 
+    assert spec.kind == "stt"
+    assert spec.config_prefix == "sense_voice_stt"
+    assert spec.required_extra == "sensevoice"
 
 
 def test_sensevoice_cli_config_is_normalized_for_the_handler():
-    pass  # TODO: implement
+    args = parse_arguments(
+        [
+            "--stt",
+            "sense-voice",
+            "--sense_voice_stt_device",
+            "cpu",
+            "--sense_voice_stt_language",
+            "yue",
+        ]
+    )
 
+    assert args.stt_backend.name == "sense-voice"
+    assert args.stt_backend.config == {
+        "model_name": "FunAudioLLM/SenseVoiceSmall",
+        "device": "cpu",
+        "language": "yue",
+        "gen_kwargs": {},
+    }
 
 
 def test_omnivoice_cli_config_is_normalized_for_the_handler():
-    pass  # TODO: implement
+    args = parse_arguments(
+        [
+            "--tts",
+            "omnivoice",
+            "--omnivoice_model_name",
+            "local/omnivoice",
+            "--omnivoice_device",
+            "xpu",
+            "--omnivoice_dtype",
+            "bfloat16",
+            "--omnivoice_ref_audio",
+            "voice.wav",
+            "--omnivoice_ref_text",
+            "Reference transcript.",
+            "--omnivoice_num_steps",
+            "16",
+            "--omnivoice_speed",
+            "1.25",
+            "--omnivoice_blocksize",
+            "256",
+        ]
+    )
 
+    assert args.tts_backend.name == "omnivoice"
+    assert args.tts_backend.config == {
+        "model_name": "local/omnivoice",
+        "device": "xpu",
+        "dtype": "bfloat16",
+        "ref_audio": "voice.wav",
+        "ref_text": "Reference transcript.",
+        "voice_clone_prompt": None,
+        "ref_voices_dir": None,
+        "instruct": None,
+        "language": None,
+        "num_steps": 16,
+        "speed": 1.25,
+        "blocksize": 256,
+        "gen_kwargs": {},
+    }
 
 
 def test_registry_rejects_duplicate_names_and_wrong_kinds():
-    pass  # TODO: implement
+    spec = BackendSpec("fake", "stt", FakeArguments, _factory)
 
+    with pytest.raises(ValueError, match="Duplicate stt backend name"):
+        build_backend_registry("stt", [spec, spec])
+    with pytest.raises(ValueError, match="expected 'llm'"):
+        build_backend_registry("llm", [spec])
 
 
 def test_supertonic_cli_config_is_normalized_for_the_handler():
-    pass  # TODO: implement
+    args = parse_arguments(
+        [
+            "--tts",
+            "supertonic",
+            "--supertonic_tts_voice",
+            "F3",
+            "--supertonic_tts_lang",
+            "fr",
+            "--supertonic_tts_speed",
+            "1.2",
+            "--supertonic_tts_blocksize",
+            "256",
+        ]
+    )
 
+    assert args.tts_backend.name == "supertonic"
+    assert args.tts_backend.config == {
+        "voice": "F3",
+        "lang": "fr",
+        "speed": 1.2,
+        "blocksize": 256,
+        "gen_kwargs": {},
+    }
 
 
 def test_audio_input_validation_uses_registry_capability_not_backend_name():
-    pass  # TODO: implement
+    spec = BackendSpec(
+        "future-audio-backend",
+        "llm",
+        FakeArguments,
+        _factory,
+        capabilities=BackendCapabilities(supports_audio_input=True),
+    )
+    selection = BackendSelection(spec, spec.normalize(FakeArguments()))
+    module_args = ModuleArguments(stt="none", llm_backend=selection.name)
 
+    prepare_module_args(module_args, selection)
 
 
 def test_llm_proxy_validation_uses_registry_capability():
-    pass  # TODO: implement
+    args = parse_arguments(["--llm_backend", "transformers"])
 
+    with pytest.raises(ValueError, match="proxy support.*responses-api.*chat-completions"):
+        build_llm_proxy_config(args.module_kwargs, args.llm_backend)
 
 
 def test_llm_proxy_validation_happens_before_pipeline_construction(monkeypatch):
-    pass  # TODO: implement
+    constructed = False
 
     def fake_build_pipeline(*_args, **_kwargs):
-        pass  # TODO: implement
+        nonlocal constructed
+        constructed = True
 
+    monkeypatch.setattr(s2s_pipeline, "setup_logger", lambda _level: None)
+    monkeypatch.setattr(s2s_pipeline, "build_pipeline", fake_build_pipeline)
 
+    with pytest.raises(ValueError, match="proxy support.*responses-api.*chat-completions"):
+        s2s_pipeline.run_pipeline_command(
+            "serve",
+            ["--llm_backend", "transformers", "--enable_llm_proxy"],
+        )
 
+    assert not constructed
 
 
 def test_test_backend_only_needs_config_factory_and_registry_entry():
-    pass  # TODO: implement
+    calls = []
 
     def factory(context, config):
-        pass  # TODO: implement
+        calls.append((context, config))
+        return "handler"
 
+    registry = build_backend_registry(
+        "stt",
+        [BackendSpec("fake", "stt", FakeArguments, factory, config_prefix="fake")],
+    )
+    parsed_config = FakeArguments(fake_option="selected")
+    spec = registry["fake"]
+    selection = BackendSelection(spec, spec.normalize(parsed_config))
 
+    assert create_backend_handler(selection, _context()) == "handler"
+    assert selection.config == {"option": "selected", "gen_kwargs": {}}
+    assert parsed_config.fake_option == "selected"
+    assert calls[0][1] is selection.config
 
 
 @pytest.mark.parametrize("backend", ["openai", "drama3"])
 def test_openai_tts_backend_constructs_through_registry(monkeypatch, backend):
-    pass  # TODO: implement
+    from ai_speech_agents_framework.TTS.drama3_handler import Drama3TTSHandler
+    from ai_speech_agents_framework.TTS.openai_compatible_handler import OpenAICompatibleTTSHandler
 
+    monkeypatch.setattr(OpenAICompatibleTTSHandler, "warmup", lambda self: None)
+    args = parse_arguments(["--tts", backend])
+    context = _context()
+    tts = create_backend_handler(args.tts_backend, context)
 
+    assert type(tts) is (Drama3TTSHandler if backend == "drama3" else OpenAICompatibleTTSHandler)
+    assert tts.cancel_scope is context.cancel_scope
+    assert tts.speculative_turns is context.speculative_turns
 
 
 def test_openai_tts_factory_receives_assistant_language_opt_in(monkeypatch):
-    pass  # TODO: implement
+    captured = {}
 
     class FakeHandler:
-        pass  # TODO: implement
         def __init__(self, *_args, setup_kwargs, **_kwargs):
-            pass  # TODO: implement
+            captured.update(setup_kwargs)
 
+    monkeypatch.setattr("ai_speech_agents_framework.backend_registry._load_handler", lambda *_args: FakeHandler)
+    context = replace(_context(), detect_llm_output_language=True)
+    create_backend_handler(parse_arguments(["--tts", "openai"]).tts_backend, context)
 
+    assert captured["detect_llm_output_language"] is True
 
 
 def test_qwen3_tts_factory_receives_assistant_language_opt_in(monkeypatch):
-    pass  # TODO: implement
+    captured = {}
 
     class FakeHandler:
-        pass  # TODO: implement
         def __init__(self, *_args, setup_kwargs, **_kwargs):
-            pass  # TODO: implement
+            captured.update(setup_kwargs)
 
+    monkeypatch.setattr("ai_speech_agents_framework.backend_registry._load_handler", lambda *_args: FakeHandler)
+    context = replace(_context(), detect_llm_output_language=True)
+    create_backend_handler(parse_arguments(["--tts", "qwen3"]).tts_backend, context)
 
+    assert captured["detect_llm_output_language"] is True
 
 
 def test_openai_stt_backend_constructs_through_registry(monkeypatch):
-    pass  # TODO: implement
+    from ai_speech_agents_framework.STT.openai_compatible_handler import OpenAICompatibleSTTHandler
 
+    monkeypatch.setattr(OpenAICompatibleSTTHandler, "warmup", lambda self: None)
+    args = parse_arguments(["--stt", "openai"])
+    stt = create_backend_handler(args.stt_backend, _context())
 
+    assert isinstance(stt, OpenAICompatibleSTTHandler)
 
 
 @pytest.mark.parametrize("live", [False, True])
 def test_windowed_http_stt_configuration_reaches_handler_and_vad(monkeypatch, live):
-    pass  # TODO: implement
+    from ai_speech_agents_framework.STT.openai_compatible_handler import OpenAICompatibleSTTHandler
 
     class DummyHandler:
-        pass  # TODO: implement
         def __init__(self, *_args, **kwargs):
-            pass  # TODO: implement
+            self.__dict__.update(kwargs.get("setup_kwargs", {}))
 
+    monkeypatch.setattr(OpenAICompatibleSTTHandler, "warmup", lambda self: None)
+    monkeypatch.setattr(s2s_pipeline, "VADHandler", DummyHandler)
+    monkeypatch.setattr(s2s_pipeline, "TranscriptionNotifier", DummyHandler)
+    monkeypatch.setattr("ai_speech_agents_framework.LLM.lm_output_processor.LMOutputProcessor", DummyHandler)
+    args = parse_arguments(["--stt", "openai", "--openai_stt_max_window_s", "120"])
+    args.module_kwargs.enable_live_transcription = live
+    other = BackendSpec("dummy", "llm", FakeArguments, lambda *_args: object())
+    selection = BackendSelection(other, other.normalize(FakeArguments()))
+    handlers = s2s_pipeline._build_handlers(
+        stop_event=Event(),
+        should_listen=Event(),
+        recv_audio_chunks_queue=Queue(),
+        spoken_prompt_queue=Queue(),
+        stt_output_queue=Queue(),
+        text_prompt_queue=Queue(),
+        lm_response_queue=Queue(),
+        lm_processed_queue=Queue(),
+        send_audio_chunks_queue=Queue(),
+        text_output_queue=Queue(),
+        module_kwargs=args.module_kwargs,
+        vad_handler_kwargs=VADHandlerArguments(enable_realtime_transcription=live),
+        stt_backend=args.stt_backend,
+        llm_backend=selection,
+        tts_backend=selection,
+        speculative_turns=SpeculativeTurnTracker(),
+        cancel_scope=CancelScope(),
+        pipeline_index=0,
+    )
+    assert handlers[0].transcription_window_samples == 120 * 16000
+    assert handlers[0].enable_realtime_transcription == live
+    stt = next(h for h in handlers if isinstance(h, OpenAICompatibleSTTHandler))
+    assert stt.max_window_s == 120
+    assert stt.window_partials_enabled == live
 
 
 @pytest.mark.parametrize(
+    ("backend_name", "expected_type", "expected_rate"),
+    [
+        ("openai-realtime", "OpenAIRealtimeSTTHandler", 24000),
+        ("vllm-realtime", "VLLMRealtimeSTTHandler", 16000),
+    ],
 )
 def test_streaming_stt_backends_parse_and_construct_through_registry(
-    pass  # TODO: implement
+    backend_name,
+    expected_type,
+    expected_rate,
 ):
+    args = parse_arguments(["--stt", backend_name])
 
+    handler = create_backend_handler(args.stt_backend, _context())
 
+    assert type(handler).__name__ == expected_type
+    assert handler.audio_sample_rate == expected_rate
+    assert args.stt_backend.config["base_url"].endswith("/v1")
+    handler.cleanup()
 
 
 def test_streaming_stt_backend_is_attached_to_vad_without_changing_notifier_path(monkeypatch):
-    pass  # TODO: implement
     class DummyHandler:
-        pass  # TODO: implement
         def __init__(self, *_args, **_kwargs):
-            pass  # TODO: implement
+            pass
 
     class DummyNotifier(DummyHandler):
-        pass  # TODO: implement
+        pass
 
+    streaming_handler = object()
 
     def stt_factory(_context, _config):
-        pass  # TODO: implement
+        return streaming_handler
 
     def other_factory(_context, _config):
-        pass  # TODO: implement
+        return object()
 
+    stt_spec = BackendSpec(
+        "streaming-stt",
+        "stt",
+        FakeArguments,
+        stt_factory,
+        capabilities=BackendCapabilities(streams_audio_chunks=True),
+    )
+    llm_spec = BackendSpec("future-llm", "llm", FakeArguments, other_factory)
+    tts_spec = BackendSpec("future-tts", "tts", FakeArguments, other_factory)
 
+    monkeypatch.setattr(s2s_pipeline, "VADHandler", DummyHandler)
+    monkeypatch.setattr(s2s_pipeline, "TranscriptionNotifier", DummyNotifier)
+    monkeypatch.setattr("ai_speech_agents_framework.LLM.lm_output_processor.LMOutputProcessor", DummyHandler)
 
+    handlers = s2s_pipeline._build_handlers(
+        stop_event=Event(),
+        should_listen=Event(),
+        recv_audio_chunks_queue=Queue(),
+        spoken_prompt_queue=Queue(),
+        stt_output_queue=Queue(),
+        text_prompt_queue=Queue(),
+        lm_response_queue=Queue(),
+        lm_processed_queue=Queue(),
+        send_audio_chunks_queue=Queue(),
+        text_output_queue=Queue(),
+        module_kwargs=ModuleArguments(),
+        vad_handler_kwargs=VADHandlerArguments(),
+        stt_backend=BackendSelection(stt_spec, stt_spec.normalize(FakeArguments())),
+        llm_backend=BackendSelection(llm_spec, llm_spec.normalize(FakeArguments())),
+        tts_backend=BackendSelection(tts_spec, tts_spec.normalize(FakeArguments())),
+        speculative_turns=SpeculativeTurnTracker(),
+        cancel_scope=CancelScope(),
+        pipeline_index=0,
+    )
 
+    assert handlers[0].streaming_stt_sink is streaming_handler
+    assert any(isinstance(handler, DummyNotifier) for handler in handlers)
 
 
 def test_new_stt_backend_gets_transcription_notifier_by_default(monkeypatch):
-    pass  # TODO: implement
+    stt_contexts = []
 
     class DummyHandler:
-        pass  # TODO: implement
         def __init__(self, *_args, **_kwargs):
-            pass  # TODO: implement
+            pass
 
     class DummyNotifier(DummyHandler):
-        pass  # TODO: implement
+        pass
 
     def stt_factory(context, _config):
-        pass  # TODO: implement
+        stt_contexts.append(context)
+        return object()
 
     def other_factory(_context, _config):
-        pass  # TODO: implement
+        return object()
 
+    stt_spec = BackendSpec("future-stt", "stt", FakeArguments, stt_factory)
+    llm_spec = BackendSpec("future-llm", "llm", FakeArguments, other_factory)
+    tts_spec = BackendSpec("future-tts", "tts", FakeArguments, other_factory)
+    stt_output_queue = Queue()
+    text_prompt_queue = Queue()
 
+    monkeypatch.setattr(s2s_pipeline, "VADHandler", DummyHandler)
+    monkeypatch.setattr(s2s_pipeline, "TranscriptionNotifier", DummyNotifier)
+    monkeypatch.setattr("ai_speech_agents_framework.LLM.lm_output_processor.LMOutputProcessor", DummyHandler)
 
+    handlers = s2s_pipeline._build_handlers(
+        stop_event=Event(),
+        should_listen=Event(),
+        recv_audio_chunks_queue=Queue(),
+        spoken_prompt_queue=Queue(),
+        stt_output_queue=stt_output_queue,
+        text_prompt_queue=text_prompt_queue,
+        lm_response_queue=Queue(),
+        lm_processed_queue=Queue(),
+        send_audio_chunks_queue=Queue(),
+        text_output_queue=Queue(),
+        module_kwargs=ModuleArguments(),
+        vad_handler_kwargs=VADHandlerArguments(),
+        stt_backend=BackendSelection(stt_spec, stt_spec.normalize(FakeArguments())),
+        llm_backend=BackendSelection(llm_spec, llm_spec.normalize(FakeArguments())),
+        tts_backend=BackendSelection(tts_spec, tts_spec.normalize(FakeArguments())),
+        speculative_turns=SpeculativeTurnTracker(),
+        cancel_scope=CancelScope(),
+        pipeline_index=0,
+    )
 
+    assert stt_contexts[0].queue_out is stt_output_queue
+    assert any(isinstance(handler, DummyNotifier) for handler in handlers)
 
 
 def test_parser_carries_only_selected_normalized_configs():
-    pass  # TODO: implement
+    args = parse_arguments(
+        [
+            "--stt",
+            "mlx-audio-whisper",
+            "--mlx_audio_whisper_model_name",
+            "custom/whisper",
+            "--language",
+            "auto",
+            "--llm_backend",
+            "transformers",
+            "--llm_gen_max_new_tokens",
+            "64",
+            "--tts",
+            "pocket",
+            "--pocket_tts_voice",
+            "alba",
+            "--pocket_tts_language",
+            "french_24l",
+        ]
+    )
 
+    assert args.stt_backend.name == "mlx-audio-whisper"
+    assert args.stt_backend.config == {
+        "model_name": "custom/whisper",
+        "language": "auto",
+        "gen_kwargs": {},
+    }
+    assert args.llm_backend.name == "transformers"
+    assert args.llm_backend.config["gen_kwargs"]["max_new_tokens"] == 64
+    assert args.tts_backend.name == "pocket"
+    assert args.tts_backend.config["voice"] == "alba"
+    assert args.tts_backend.config["language"] == "french_24l"
+    assert not hasattr(args, "whisper_stt_handler_kwargs")
+    assert not hasattr(args, "qwen3_tts_handler_kwargs")
 
 
 def test_facebook_mms_options_are_normalized_for_handler_setup(monkeypatch):
-    pass  # TODO: implement
+    from ai_speech_agents_framework.TTS.facebookmms_handler import FacebookMMSTTSHandler
 
+    captured = {}
 
     def fake_setup(self, _should_listen, **kwargs):
-        pass  # TODO: implement
+        captured.update(kwargs)
 
+    monkeypatch.setattr(FacebookMMSTTSHandler, "setup", fake_setup)
+    args = parse_arguments(
+        [
+            "--tts",
+            "facebookMMS",
+            "--tts_language",
+            "fr",
+            "--facebook_mms_model_name",
+            "acme/custom-mms",
+        ]
+    )
 
+    assert args.tts_backend.config["language"] == "fr"
+    assert "tts_language" not in args.tts_backend.config
+    create_backend_handler(args.tts_backend, _context())
+    assert captured["language"] == "fr"
+    assert captured["model_name"] == "acme/custom-mms"
 
 
 def test_facebook_mms_handler_honors_model_override(monkeypatch):
-    pass  # TODO: implement
+    from ai_speech_agents_framework.TTS.facebookmms_handler import FacebookMMSTTSHandler
 
+    load_calls = []
+    monkeypatch.setattr(
+        FacebookMMSTTSHandler,
+        "load_model",
+        lambda self, language, model_name=None: load_calls.append((language, model_name)),
+    )
+    monkeypatch.setattr(FacebookMMSTTSHandler, "warmup", lambda self: None)
+    handler = FacebookMMSTTSHandler.__new__(FacebookMMSTTSHandler)
 
+    handler.setup(Event(), model_name="acme/custom-mms", language="fr", device="cpu")
 
+    assert load_calls == [("fr", "acme/custom-mms")]
+    assert handler._initial_model_name == "acme/custom-mms"
 
 
 def test_facebook_mms_restores_custom_model_when_returning_to_initial_language(monkeypatch):
-    pass  # TODO: implement
+    from ai_speech_agents_framework.pipeline.messages import TTSInput
+    from ai_speech_agents_framework.TTS.facebookmms_handler import FacebookMMSTTSHandler
 
+    load_calls = []
 
     def fake_load_model(self, language, model_name=None):
-        pass  # TODO: implement
+        load_calls.append((language, model_name))
+        self.language = language
+        self.model_name = model_name or f"default/{language}"
 
+    monkeypatch.setattr(FacebookMMSTTSHandler, "load_model", fake_load_model)
+    monkeypatch.setattr(FacebookMMSTTSHandler, "generate_audio", lambda self, _text: None)
+    handler = FacebookMMSTTSHandler.__new__(FacebookMMSTTSHandler)
+    handler._initial_language = "en"
+    handler._initial_model_name = "acme/custom-mms"
+    handler.language = "en"
+    handler.model_name = "acme/custom-mms"
+    handler.cancel_scope = None
 
+    list(handler.process(TTSInput(text="Bonjour", language_code="fr")))
+    list(handler.process(TTSInput(text="Hello", language_code="en")))
 
+    assert load_calls == [("fr", None), ("en", "acme/custom-mms")]
 
 
 def test_facebook_mms_session_reset_restores_custom_model_for_same_language(monkeypatch):
-    pass  # TODO: implement
+    from ai_speech_agents_framework.TTS.facebookmms_handler import FacebookMMSTTSHandler
 
+    load_calls = []
+    monkeypatch.setattr(
+        FacebookMMSTTSHandler,
+        "load_model",
+        lambda self, language, model_name=None: load_calls.append((language, model_name)),
+    )
+    handler = FacebookMMSTTSHandler.__new__(FacebookMMSTTSHandler)
+    handler._initial_language = "en"
+    handler._initial_model_name = "acme/custom-mms"
+    handler.language = "en"
+    handler.model_name = "facebook/mms-tts-eng"
 
+    handler.on_session_end()
 
+    assert load_calls == [("en", "acme/custom-mms")]
 
 
 def test_parser_warning_ignores_known_options_for_inactive_backends(caplog):
-    pass  # TODO: implement
+    args = parse_arguments(
+        [
+            "--stt",
+            "parakeet-tdt",
+            "--mlx_audio_whisper_model_name",
+            "unused/whisper",
+            "--language=auto",
+            "--tts",
+            "qwen3",
+            "--pocket_tts_voice",
+            "alba",
+        ]
+    )
 
+    assert args.stt_backend.name == "parakeet-tdt"
+    assert args.tts_backend.name == "qwen3"
+    assert args.stt_backend.config["language"] is None
+    assert "mlx_audio_whisper_model_name" not in args.stt_backend.config
+    assert "pocket_tts_voice" not in args.tts_backend.config
+    assert "--language" in caplog.text
+    assert "--mlx_audio_whisper_model_name" in caplog.text
+    assert "--pocket_tts_voice" in caplog.text
+    assert "unused/whisper" not in caplog.text
 
 
 def test_parser_still_rejects_unknown_options():
-    pass  # TODO: implement
+    with pytest.raises(ValueError, match="--unknown_backend_option"):
+        parse_arguments(["--unknown_backend_option", "value"])
 
 
 @pytest.mark.parametrize("selector", ["--stt", "--llm_backend", "--tts"])
 def test_parser_reports_invalid_backend_selectors_with_argparse(selector, capsys):
-    pass  # TODO: implement
+    with pytest.raises(SystemExit, match="2"):
+        parse_arguments([selector, "not-a-backend"])
 
+    stderr = capsys.readouterr().err
+    assert "usage: ai-speech-agents-framework serve" in stderr
+    assert "invalid choice: 'not-a-backend'" in stderr
 
 
 @pytest.mark.parametrize("backend_name", ["whisper", "whisper-mlx", "mlx-audio-whisper"])
 def test_common_language_flag_reaches_compatible_stt_backends(backend_name, caplog):
-    pass  # TODO: implement
+    args = parse_arguments(["--stt", backend_name, "--language", "de"])
 
+    assert args.stt_backend.config["language"] == "de"
+    assert "Ignoring options for inactive backends" not in caplog.text
 
 
 @pytest.mark.parametrize(
+    ("kind", "backend_name"),
+    [
+        *(("stt", name) for name in STT_BACKENDS),
+        *(("llm", name) for name in LLM_BACKENDS),
+        *(("tts", name) for name in TTS_BACKENDS),
+    ],
 )
 def test_global_device_only_updates_device_aware_builtin_configs(kind, backend_name):
-    pass  # TODO: implement
+    selector = {"stt": "--stt", "llm": "--llm_backend", "tts": "--tts"}[kind]
+    argv = ["--device", "cpu", selector, backend_name]
+    if kind == "stt" and backend_name == "none":
+        argv.extend(["--llm_backend", "chat-completions"])
 
+    args = parse_arguments(argv)
+    field_name = f"{kind}_backend"
+    before = deepcopy(getattr(args, field_name).config)
 
+    prepare_all_args(args)
 
+    expected = deepcopy(before)
+    if "device" in expected:
+        expected["device"] = "cpu"
+    assert getattr(args, field_name).config == expected
 
 
 def test_global_device_does_not_reach_mlx_audio_whisper_setup(monkeypatch):
-    pass  # TODO: implement
+    from ai_speech_agents_framework.STT.mlx_audio_whisper_handler import MLXAudioWhisperSTTHandler
 
+    captured = {}
 
     def fake_setup(self, model_name, language, gen_kwargs):
-        pass  # TODO: implement
+        captured.update(model_name=model_name, language=language, gen_kwargs=gen_kwargs)
 
+    monkeypatch.setattr(MLXAudioWhisperSTTHandler, "setup", fake_setup)
+    args = parse_arguments(
+        [
+            "--device",
+            "mps",
+            "--stt",
+            "mlx-audio-whisper",
+            "--language",
+            "auto",
+        ]
+    )
+    prepare_all_args(args)
 
+    create_backend_handler(args.stt_backend, _context())
 
+    assert captured == {
+        "model_name": "mlx-community/whisper-large-v3-turbo",
+        "language": "auto",
+        "gen_kwargs": {},
+    }
 
 
 def test_registry_import_keeps_backend_modules_lazy():
-    pass  # TODO: implement
+    # A fresh process observes the initial import without clearing its evidence
+    # or disturbing the backend modules used by other tests.
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
 import sys
 import ai_speech_agents_framework.backend_registry
 
 eager_backends = [
+    name for name in sys.modules
+    if name.startswith(("ai_speech_agents_framework.STT.", "ai_speech_agents_framework.TTS."))
+    or (name.startswith("ai_speech_agents_framework.LLM.") and name.endswith("language_model"))
 ]
 assert not eager_backends, f"Registry imported backend modules: {eager_backends}"
 """,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
 
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_dependency_error_names_backend_and_required_extra():
-    pass  # TODO: implement
     def missing(_context, _config):
-        pass  # TODO: implement
+        raise ImportError("missing package")
 
+    spec = BackendSpec(
+        "optional",
+        "tts",
+        FakeArguments,
+        missing,
+        required_extra="optional-extra",
+    )
+    selection = BackendSelection(spec, spec.normalize(FakeArguments()))
 
+    with pytest.raises(ImportError, match=r"optional.*tts.*ai-speech-agents-framework\[optional-extra\]"):
+        create_backend_handler(selection, _context())
 
 
 @pytest.mark.parametrize("option", ["--live_transcription_min_silence_ms", "--parakeet_tdt_compute_type"])
 def test_removed_ineffective_options_are_rejected(option):
-    pass  # TODO: implement
+    with pytest.raises(ValueError, match=option):
+        parse_arguments([option, "500" if "silence" in option else "float32"])
 
 
 @pytest.mark.parametrize("enabled", [False, True])
 def test_viseme_stage_is_optional_and_connected_after_tts(monkeypatch, enabled):
-    pass  # TODO: implement
+    contexts = {}
 
     class DummyHandler:
-        pass  # TODO: implement
         def __init__(self, *_args, **kwargs):
-            pass  # TODO: implement
+            self.queue_in = kwargs["queue_in"]
+            self.queue_out = kwargs["queue_out"]
+            self.setup_kwargs = kwargs.get("setup_kwargs", {})
 
     def factory(name):
-        pass  # TODO: implement
         def build(context, _config):
-            pass  # TODO: implement
+            contexts[name] = context
+            return object()
 
+        return build
 
+    monkeypatch.setattr(s2s_pipeline, "VADHandler", DummyHandler)
+    monkeypatch.setattr(s2s_pipeline, "TranscriptionNotifier", DummyHandler)
+    monkeypatch.setattr("ai_speech_agents_framework.LLM.lm_output_processor.LMOutputProcessor", DummyHandler)
+    monkeypatch.setattr("ai_speech_agents_framework.STV.w2v_stv_handler.Wav2Vec2STVHandler", DummyHandler)
+    specs = [BackendSpec(name, name, FakeArguments, factory(name)) for name in ("stt", "llm", "tts")]
+    output_queue = Queue()
+    cancel_scope = CancelScope()
+    handlers = s2s_pipeline._build_handlers(
+        stop_event=Event(),
+        should_listen=Event(),
+        recv_audio_chunks_queue=Queue(),
+        spoken_prompt_queue=Queue(),
+        stt_output_queue=Queue(),
+        text_prompt_queue=Queue(),
+        lm_response_queue=Queue(),
+        lm_processed_queue=Queue(),
+        send_audio_chunks_queue=output_queue,
+        text_output_queue=Queue(),
+        module_kwargs=ModuleArguments(enable_visemes=enabled, stv_device="cpu"),
+        vad_handler_kwargs=VADHandlerArguments(),
+        stt_backend=BackendSelection(specs[0], specs[0].normalize(FakeArguments())),
+        llm_backend=BackendSelection(specs[1], specs[1].normalize(FakeArguments())),
+        tts_backend=BackendSelection(specs[2], specs[2].normalize(FakeArguments())),
+        speculative_turns=SpeculativeTurnTracker(),
+        cancel_scope=cancel_scope,
+        pipeline_index=0,
+    )
+    if enabled:
+        assert handlers[-1].queue_in is contexts["tts"].queue_out
+        assert handlers[-1].queue_out is output_queue
+        assert handlers[-1].setup_kwargs["cancel_scope"] is cancel_scope
+    else:
+        assert contexts["tts"].queue_out is output_queue
 
 
 def test_viseme_cli_and_json_configuration(tmp_path):
-    pass  # TODO: implement
+    import json
 
+    argv = ["--enable_visemes", "--stv_device", "cpu", "--stv_model_name", "custom/phonemes"]
+    config = tmp_path / "visemes.json"
+    config.write_text(json.dumps({"enable_visemes": True, "stv_device": "cpu", "stv_model_name": "custom/phonemes"}))
+    for args in (parse_arguments(argv), parse_arguments([str(config)])):
+        assert args.module_kwargs.enable_visemes
+        assert args.module_kwargs.stv_device == "cpu"
+        assert args.module_kwargs.stv_model_name == "custom/phonemes"
+    assert not parse_arguments([]).module_kwargs.enable_visemes
 
 
 def test_pocket_farsi_model_cli_routes_to_setup():
-    pass  # TODO: implement
+    args = parse_arguments(
+        [
+            "--tts",
+            "pocket",
+            "--pocket_tts_model_name",
+            "mehdi-hf/pocket-tts-farsi-v2",
+            "--pocket_tts_voice",
+            "/voices/farsi.wav",
+            "--pocket_tts_temperature",
+            "0.3",
+            "--pocket_tts_eos_threshold",
+            "-2",
+        ]
+    )
+    assert args.tts_backend.name == "pocket"
+    assert args.tts_backend.config["model_name"] == "mehdi-hf/pocket-tts-farsi-v2"
+    assert args.tts_backend.config["voice"] == "/voices/farsi.wav"
+    assert args.tts_backend.config["temperature"] == 0.3
+    assert args.tts_backend.config["eos_threshold"] == -2.0

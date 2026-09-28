@@ -8,19 +8,25 @@ import pytest
 from nltk import sent_tokenize
 
 from ai_speech_agents_framework.LLM.utils import (
+    WHISPER_LANGUAGE_TO_LLM_LANGUAGE,
+    remove_markdown,
+    remove_unspeechable,
+    resolve_auto_language,
+    sent_tokenize_preserving_markdown_code,
 )
 
 
 def test_remove_unspeechable_normalizes_smart_apostrophes() -> None:
-    pass  # TODO: implement
+    assert remove_unspeechable("I’ll reply if here’s the plan.") == "I'll reply if here's the plan."
 
 
 def test_remove_unspeechable_keeps_text_and_drops_emoji() -> None:
-    pass  # TODO: implement
+    assert remove_unspeechable("Hello 👋 lobster 🦞") == "Hello  lobster "
 
 
 def test_remove_unspeechable_keeps_chinese_punctuation() -> None:
-    pass  # TODO: implement
+    text = "你好，今天怎么样？很好！停顿；说明：一、二。"
+    assert remove_unspeechable(text) == text
 
 
 # --- language name coverage ---------------------------------------------------------------
@@ -36,11 +42,25 @@ def test_remove_unspeechable_keeps_chinese_punctuation() -> None:
 
 # Modules that declare a SUPPORTED_LANGUAGES list of codes they can report.
 _STT_HANDLER_MODULES = [
+    "ai_speech_agents_framework.STT.parakeet_tdt_handler",
+    "ai_speech_agents_framework.STT.whisper_stt_handler",
+    "ai_speech_agents_framework.STT.mlx_audio_whisper_handler",
+    "ai_speech_agents_framework.STT.lightning_whisper_mlx_handler",
+    "ai_speech_agents_framework.STT.faster_whisper_handler",
+    "ai_speech_agents_framework.STT.qwen3_asr_handler",
+    "ai_speech_agents_framework.STT.nemo_asr_handler",
 ]
 
 # These have no optional top-level dependency, so a skip here means something is wrong
 # rather than merely uninstalled.
 _ALWAYS_IMPORTABLE = {
+    "ai_speech_agents_framework.STT.parakeet_tdt_handler",
+    "ai_speech_agents_framework.STT.whisper_stt_handler",
+    "ai_speech_agents_framework.STT.mlx_audio_whisper_handler",
+    "ai_speech_agents_framework.STT.qwen3_asr_handler",
+    # Importable via the stub above, so a skip here would mean the stub stopped working.
+    "ai_speech_agents_framework.STT.faster_whisper_handler",
+    "ai_speech_agents_framework.STT.nemo_asr_handler",
 }
 
 
@@ -48,96 +68,180 @@ _ALWAYS_IMPORTABLE = {
 # checkable on CI. The list is a plain literal, so no real dependency is needed to read it,
 # and without this the faster-whisper check would silently skip everywhere.
 _STUBBABLE_DEPENDENCIES = {
+    "ai_speech_agents_framework.STT.faster_whisper_handler": ("faster_whisper", "WhisperModel"),
 }
 
 
 def _supported_languages(module_name):
-    pass  # TODO: implement
+    stub = _STUBBABLE_DEPENDENCIES.get(module_name)
+    with ExitStack() as stack:
+        if stub is not None and stub[0] not in sys.modules:
+            package, attribute = stub
+            module = types.ModuleType(package)
+            setattr(module, attribute, object)
+            stack.enter_context(mock.patch.dict(sys.modules, {package: module}))
+            stack.callback(sys.modules.pop, module_name, None)
+        try:
+            handler_module = importlib.import_module(module_name)
+        except ImportError:
+            return None
+        return list(handler_module.SUPPORTED_LANGUAGES)
 
 
 @pytest.mark.parametrize("module_name", _STT_HANDLER_MODULES)
 def test_every_stt_language_has_an_llm_language_name(module_name):
-    pass  # TODO: implement
+    """Any language a bundled STT backend can report must be nameable for the prompt."""
+    languages = _supported_languages(module_name)
+    if languages is None:
+        if module_name in _ALWAYS_IMPORTABLE:
+            pytest.fail(f"{module_name} should be importable without optional extras")
+        pytest.skip(f"{module_name} requires an optional dependency")
 
+    missing = sorted(code for code in languages if code not in WHISPER_LANGUAGE_TO_LLM_LANGUAGE)
+    assert missing == [], (
+        f"{module_name} can report {missing}, which have no entry in "
+        f"WHISPER_LANGUAGE_TO_LLM_LANGUAGE, so --enable_lang_prompt would emit no "
+        f"instruction for them"
+    )
 
 
 def test_language_names_are_lowercase_and_non_empty():
-    pass  # TODO: implement
+    """The name is interpolated mid-sentence, so it must read as lowercase prose."""
+    for code, name in WHISPER_LANGUAGE_TO_LLM_LANGUAGE.items():
+        assert name and name == name.lower(), f"{code} -> {name!r}"
+        # Multi-word names such as "haitian creole" are fine; punctuation is not.
+        assert name.replace(" ", "").isalpha(), f"{code} -> {name!r}"
+        assert name == name.strip(), f"{code} -> {name!r}"
 
 
 def test_whisper_language_coverage_is_complete():
-    pass  # TODO: implement
+    """Whisper reports 100 languages; a missing name silently drops the prompt."""
+    # Other backends add codes Whisper lacks (Qwen3-ASR reports Filipino as "fil"), hence at least.
+    assert len(WHISPER_LANGUAGE_TO_LLM_LANGUAGE) >= 100
+    # Spot-check languages that only Whisper-family backends can report.
+    for code in ("ar", "tr", "he", "th", "yue", "haw"):
+        assert code in WHISPER_LANGUAGE_TO_LLM_LANGUAGE
 
 
 # --- resolve_auto_language ----------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
+    ("code", "expected"),
+    [
+        ("sv", ("sv", "swedish")),
+        ("sv-auto", ("sv", "swedish")),
+        ("ru-auto", ("ru", "russian")),
+        ("no-auto", ("no", "norwegian")),
+        ("lt", ("lt", "lithuanian")),
+        ("en-auto", ("en", "english")),
+    ],
 )
 def test_resolve_auto_language_names_parakeet_languages(code, expected):
-    pass  # TODO: implement
+    assert resolve_auto_language(code) == expected
 
 
 @pytest.mark.parametrize("code", [None, ""])
 def test_resolve_auto_language_passes_through_empty_codes(code):
-    pass  # TODO: implement
+    assert resolve_auto_language(code) == (code, None)
 
 
 def test_resolve_auto_language_returns_no_name_for_unknown_code():
-    pass  # TODO: implement
+    """Unknown codes still round-trip the code, they just cannot be named."""
+    assert resolve_auto_language("xx-auto") == ("xx", None)
 
 
 def test_remove_markdown_strips_bold_and_italic() -> None:
-    pass  # TODO: implement
+    assert remove_markdown("**bold** and *italic* text") == "bold and italic text"
+    assert remove_markdown("__bold__ and _italic_ text") == "bold and italic text"
 
 
 def test_remove_markdown_strips_adjacent_single_char_emphasis_spans() -> None:
-    pass  # TODO: implement
+    # Two independent single-character emphasis spans must be stripped on their
+    # own, not merged into one span that leaks the inner delimiters into TTS.
+    assert remove_markdown("You got grade *A* or *B* today") == "You got grade A or B today"
+    assert remove_markdown("*a* and *b*") == "a and b"
+    assert remove_markdown("_a_ and _b_") == "a and b"
+    assert remove_markdown("**A** and **B**") == "A and B"
+    assert remove_markdown("*a* *b* *c*") == "a b c"
 
 
 def test_remove_markdown_keeps_snake_case_identifiers() -> None:
-    pass  # TODO: implement
+    assert remove_markdown("function_call_output") == "function_call_output"
 
 
 def test_remove_markdown_strips_bullets_without_eating_following_lines() -> None:
-    pass  # TODO: implement
+    assert remove_markdown("* first\n* second\n* third") == "first\nsecond\nthird"
+    assert remove_markdown("- one\n- two") == "one\ntwo"
 
 
 def test_remove_markdown_strips_headings() -> None:
-    pass  # TODO: implement
+    assert remove_markdown("# Title\nsome text") == "Title\nsome text"
+    assert remove_markdown("### Subheading") == "Subheading"
+    assert remove_markdown("#include <stdio.h>") == "#include <stdio.h>"
 
 
 def test_remove_markdown_does_not_eat_multiplication() -> None:
-    pass  # TODO: implement
+    assert remove_markdown("2 * 3 * 4") == "2 * 3 * 4"
+    assert remove_markdown("2*3 = 6") == "2*3 = 6"
+    assert remove_markdown("x*y") == "x*y"
+    assert remove_markdown("5**2 = 25") == "5**2 = 25"
 
 
 def test_remove_markdown_does_not_pair_independent_compact_operators() -> None:
-    pass  # TODO: implement
+    assert remove_markdown("2*3 + 4*5") == "2*3 + 4*5"
+    assert remove_markdown("5**2 + 3**4") == "5**2 + 3**4"
+    assert remove_markdown("x*y and a*b") == "x*y and a*b"
+    assert remove_markdown("x*y*z") == "x*y*z"
+    assert remove_markdown("x**y**z") == "x**y**z"
+    assert remove_markdown("力*質量*時間") == "力*質量*時間"
+    assert remove_markdown("скорость*время*путь") == "скорость*время*путь"
+    assert remove_markdown("α*β*γ") == "α*β*γ"
+    assert remove_markdown("a*β*c") == "a*β*c"
 
 
 def test_remove_markdown_preserves_unmatched_delimiters_and_operators() -> None:
-    pass  # TODO: implement
+    assert remove_markdown("*args") == "*args"
+    assert remove_markdown("**kwargs") == "**kwargs"
+    assert remove_markdown("_private") == "_private"
+    assert remove_markdown("file*.txt") == "file*.txt"
+    assert remove_markdown("Price is $5* tax.") == "Price is $5* tax."
+    assert remove_markdown("force*mass*time") == "force*mass*time"
+    assert remove_markdown("`unclosed") == "`unclosed"
+    assert remove_markdown("Do you mean snake case**?") == "Do you mean snake case**?"
 
 
 def test_remove_markdown_strips_nested_bold_and_code() -> None:
-    pass  # TODO: implement
+    assert remove_markdown("**bold with `code`**") == "bold with code"
 
 
 def test_remove_markdown_strips_inline_code() -> None:
-    pass  # TODO: implement
+    assert remove_markdown("`inline`") == "inline"
 
 
 def test_remove_markdown_preserves_markdown_like_characters_inside_code() -> None:
-    pass  # TODO: implement
+    assert remove_markdown("Use `*args` and `**kwargs`.") == "Use *args and **kwargs."
+    assert remove_markdown("Match `*.py` files.") == "Match *.py files."
+    assert (
+        remove_markdown("```python\n*args = values\n# keep_this\n**literal**\n```")
+        == "*args = values\n# keep_this\n**literal**\n"
+    )
 
 
 def test_remove_markdown_strips_fenced_code_block_and_language_tag() -> None:
-    pass  # TODO: implement
+    assert remove_markdown("```python\nname = 'Alice'\n```") == "name = 'Alice'\n"
+    assert remove_markdown("```\ncode\n```") == "code\n"
+    assert remove_markdown("```code```") == "code"
 
 
 def test_remove_markdown_is_streaming_safe_across_split_deltas() -> None:
-    pass  # TODO: implement
+    """remove_markdown must be applied to complete text, not per-delta: a
+    delimiter pair split across two deltas (*ita / lic*) has nothing to match
+    on its own, so callers accumulate first and strip once, as tested here."""
+    deltas = ["*ita", "lic* is a word."]
+    accumulated = "".join(deltas)
+    assert remove_markdown(accumulated) == "italic is a word."
 
 
 def test_sentence_tokenization_preserves_complete_emphasis_pairs() -> None:
-    pass  # TODO: implement
+    assert sent_tokenize_preserving_markdown_code("**Let me check.**", sent_tokenize) == ["**Let me check.**"]

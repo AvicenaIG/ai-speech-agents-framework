@@ -26,46 +26,85 @@ LANGUAGE_INSTRUCTION_PREFIX = "Please reply to my message in "
 
 
 class _FakeCompletions:
-    pass  # TODO: implement
     def __init__(self):
-        pass  # TODO: implement
+        self.next_result = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="ok", tool_calls=[]))],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+        )
+        self.calls: list[dict] = []
 
     def create(self, **kwargs):
-        pass  # TODO: implement
+        self.calls.append(kwargs)
+        return self.next_result
 
 
 class _FakeClient:
-    pass  # TODO: implement
     def __init__(self, *a, **k):
-        pass  # TODO: implement
+        self.chat = SimpleNamespace(completions=_FakeCompletions())
 
     def with_options(self, **kwargs):
-        pass  # TODO: implement
+        return self
 
 
 def _make_handler(*, enable_lang_prompt):
-    pass  # TODO: implement
+    orig_openai = base_mod.OpenAI
+    base_mod.OpenAI = _FakeClient
+    try:
+        return ChatCompletionsApiModelHandler(
+            threading.Event(),
+            queue.Queue(),
+            queue.Queue(),
+            setup_kwargs=dict(
+                model_name="test-model",
+                base_url="http://fake/v1",
+                api_key="k",
+                stream=False,
+                disable_thinking=True,
+                compact_history=False,
+                enable_lang_prompt=enable_lang_prompt,
+            ),
+        )
+    finally:
+        base_mod.OpenAI = orig_openai
 
 
 def _sent_system_messages(handler, language_code, *, enable_lang_prompt=True):
-    pass  # TODO: implement
+    """Drive one request and return system message contents the backend sent."""
+    chat = Chat(10)
+    chat.add_item(make_user_message("Hej, hur mar du?"))
+    session = RealtimeSessionCreateRequest(type="realtime", instructions="You are a robot.")
+    rc = RuntimeConfig(chat=chat, session=session)
+    req = GenerateResponseRequest(runtime_config=rc, language_code=language_code, turn_id="t", turn_revision=0)
 
+    list(handler.process(req))
 
+    calls = handler.client.chat.completions.calls
+    assert calls, "the backend never issued a request"
+    return [m.get("content") for m in calls[-1]["messages"] if m.get("role") == "system"]
 
 
 def test_swedish_gets_a_language_instruction():
-    pass  # TODO: implement
+    """Swedish is one of the 17 Parakeet languages that previously got nothing."""
+    handler = _make_handler(enable_lang_prompt=True)
 
+    contents = _sent_system_messages(handler, "sv-auto")
 
+    assert any(isinstance(c, str) and f"{LANGUAGE_INSTRUCTION_PREFIX}swedish." in c for c in contents)
 
 
 def test_no_instruction_when_the_flag_is_disabled():
-    pass  # TODO: implement
+    """The flag still gates the instruction; this is the default configuration."""
+    handler = _make_handler(enable_lang_prompt=False)
 
+    contents = _sent_system_messages(handler, "sv-auto")
 
+    assert not [c for c in contents if isinstance(c, str) and LANGUAGE_INSTRUCTION_PREFIX in c]
 
 
 def test_unknown_language_code_still_emits_no_instruction():
-    pass  # TODO: implement
+    """An unnameable code must not produce 'reply in None.' -- absent is correct here."""
+    handler = _make_handler(enable_lang_prompt=True)
 
+    contents = _sent_system_messages(handler, "xx-auto")
 
+    assert not [c for c in contents if isinstance(c, str) and LANGUAGE_INSTRUCTION_PREFIX in c]
